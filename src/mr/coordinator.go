@@ -131,7 +131,6 @@ func (c *Coordinator) Schedule() {
 func (c *Coordinator) initMapPhase() {
 	log.Println("[initMap] initializing....")
 	for i := 0; i < len(c.files); i++ {
-		c.nextTaskid++
 		t := &Task{
 			Type:     MapTask,
 			TaskId:   c.nextTaskid,
@@ -139,6 +138,7 @@ func (c *Coordinator) initMapPhase() {
 			FileName: c.files[i],
 		}
 		c.tasks[c.nextTaskid] = t
+		c.nextTaskid++
 	}
 
 	//把 bitmap 中额外的位置置为1
@@ -159,6 +159,7 @@ func (c *Coordinator) initExitPhase() {
 		// 启动一个定时器，时间到达后，c.schedule 退出
 		time.Sleep(5 * time.Second)
 		c.exitch <- struct{}{}
+		c.done <- struct{}{}
 	}()
 }
 
