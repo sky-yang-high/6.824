@@ -170,7 +170,7 @@ func (c *Coordinator) initReducePhase() {
 
 	//重置 bitmap
 	c.bitm.clear()
-	for i := c.nReduce; i < defaultBitSize*2; i++ {
+	for i := c.nReduce; i < defaultBitSize*8; i++ {
 		c.bitm.set(uint(i))
 	}
 }
@@ -215,7 +215,6 @@ func (c *Coordinator) AssignTask(hreply *HeartReply) {
 	// * 然后，跳转到下一个任务的位置，如果有任务完成，则从环上移走该任务
 	// * 可以发现，如果某个任务第一次被分配出去后，worker 挂了，会在下一轮重新分配给其他 worker
 	// * 难点在于跳转到下一个环的位置，要求 bitmap 提供接口
-	defer log.Println("[Assign] assigned task: ", hreply.FileNames)
 
 	// 告知每个 worker exit
 	if c.phase == Exitting {
@@ -232,6 +231,7 @@ func (c *Coordinator) AssignTask(hreply *HeartReply) {
 	t := c.tasks[id]
 
 	hreply.Task = *t //? 或许这里应该减少一次拷贝?
+	log.Println("[Assign] assigned task: ", hreply.FileNames)
 }
 
 // 接收上报信息
