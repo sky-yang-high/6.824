@@ -6,24 +6,45 @@ package mr
 // remember to capitalize all names.
 //
 
-import "os"
-import "strconv"
-
-//
-// example to show how to declare the arguments
-// and reply for an RPC.
-//
-
-type ExampleArgs struct {
-	X int
-}
-
-type ExampleReply struct {
-	Y int
-}
+import (
+	"os"
+	"strconv"
+)
 
 // Add your RPC definitions here.
 
+type TaskType int
+
+const (
+	MapTask    TaskType = iota //task 类型为 map
+	ReduceTask                 //task 类型为 reduce
+	WaitTask                   //task 类型为 wait
+	ExitTask                   //task 类型为 exit
+)
+
+// 具体的 task 定义
+type Task struct {
+	Type     TaskType //任务类型
+	TaskId   int      //task 的 id
+	NReduce  int      //用于 hash
+	FileName string   //task 的文件
+}
+
+// 心跳请求，在 worker 有空时发送
+type HeartRequset struct{}
+
+// 心跳响应，在 worker 有空时发送，Coordinator填充数据
+type HeartReply struct {
+	Task
+}
+
+// 上报请求，worker 完成 task 时发送
+type ReportRequest struct {
+	TaskId int //完成的 task 的 id
+}
+
+// 上报响应，worker 完成 task 时发送
+type ReportReply struct{}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
