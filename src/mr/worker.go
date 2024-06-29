@@ -125,6 +125,12 @@ func doReduceTask(t *Task, reducef func(string, []string) string) {
 		f.Close()
 	}
 
+	//在某些测试里会发生这个情况，所以要判断一下
+	if len(kvs) == 0 {
+		doReport(t)
+		return
+	}
+
 	sort.Slice(kvs, func(i, j int) bool {
 		return kvs[i].Key < kvs[j].Key
 	})
