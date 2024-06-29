@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/rpc"
 	"os"
+	"sort"
 	"strconv"
 	"time"
 )
@@ -70,9 +71,9 @@ func doMapTask(t *Task, mapf func(string, string) []KeyValue) {
 	// * 把中间结果，根据 ihash(key) % NReduce，写入不同的文件中，以 json 格式
 	// * 最后上报给 Coordinator
 
-	log.Printf("[Mapping]: task-%d, file-%s\n", t.TaskId, t.FileName)
+	log.Printf("[Mapping] task-%d, %s\n", t.TaskId, t.FileNames[0])
 
-	file, err := os.Open(t.FileName)
+	file, err := os.Open(t.FileNames[0]) //对于 map 任务，file只有一个文件
 	if err != nil {
 		log.Fatalln("[Mapping]: fail to open file", err)
 	}
@@ -81,9 +82,9 @@ func doMapTask(t *Task, mapf func(string, string) []KeyValue) {
 		log.Fatalln("[Mapping]: fail to read file", err)
 	}
 
-	intermediate := mapf(t.FileName, string(content))
+	kvs := mapf(t.FileNames[0], string(content))
 	HashedKV := make([][]KeyValue, t.NReduce)
-	for _, kv := range intermediate {
+	for _, kv := range kvs {
 		index := ihash(kv.Key) % t.NReduce
 		HashedKV[index] = append(HashedKV[index], kv)
 	}
@@ -92,7 +93,7 @@ func doMapTask(t *Task, mapf func(string, string) []KeyValue) {
 		ofName := "mr-tmp-" + strconv.Itoa(t.TaskId) + "-" + strconv.Itoa(i) + ".txt"
 		of, err := os.OpenFile(ofName, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0666)
 		if err != nil {
-			log.Fatalln("[Mapping]: fail to write to file: ", ofName, err)
+			log.Fatalln("[Mapping] fail to write to file: ", ofName, err)
 		}
 		enc := json.NewEncoder(of)
 		for _, kv := range HashedKV[i] {
@@ -104,9 +105,54 @@ func doMapTask(t *Task, mapf func(string, string) []KeyValue) {
 	doReport(t)
 }
 
-// todo
 // 进行 reduce 任务
 func doReduceTask(t *Task, reducef func(string, []string) string) {
+	// * 实现思路：读取 task 中的几个文件，用json 解码得到很多 kv对
+	// * 然后排序，参照 mrsequential.go 中的思路，批量处理相同的 key，结果重新写入文件中(或许这里可以不需要重新hash)
+	// * 最后上报给 Coordinator 即可
+	log.Printf("[Reducing] task-%d, %v", t.TaskId, t.FileNames)
+	var kvs []KeyValue
+	kv := KeyValue{}
+	for _, fn := range t.FileNames {
+		f, err := os.Open(fn)
+		if err != nil {
+			log.Fatalln("[Reducing] fail to open file: ", fn)
+		}
+		dec := json.NewDecoder(f)
+		for err := dec.Decode(&kv); err == nil; err = dec.Decode(&kv) {
+			kvs = append(kvs, kv)
+		}
+		f.Close()
+	}
+
+	sort.Slice(kvs, func(i, j int) bool {
+		return kvs[i].Key < kvs[j].Key
+	})
+
+	//理论上，这些 key 的 hash % nreduce 都是相同的，因此取第一个来创建文件即可
+	oname := "mr-out-" + strconv.Itoa(ihash(kvs[0].Key)%t.NReduce) + ".txt"
+	ofile, err := os.Create(oname)
+	if err != nil {
+		log.Fatalln("[Reducing] fail to create file: ", err)
+	}
+
+	//from mrsequential.go
+	i := 0
+	for i < len(kvs) {
+		j := i + 1
+		for j < len(kvs) && kvs[j].Key == kvs[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, kvs[k].Value)
+		}
+		output := reducef(kvs[i].Key, values)
+		fmt.Fprintf(ofile, "%v %v\n", kvs[i].Key, output)
+
+		i = j
+	}
+	ofile.Close()
 
 	doReport(t)
 }
@@ -116,13 +162,13 @@ func doReport(t *Task) {
 	rreq, rreply := &ReportRequest{t.TaskId}, &ReportReply{}
 	ok := call("Coordinator.HandleReport", rreq, rreply)
 	if !ok {
-		log.Fatal("[Reporting]: fail to call Coordinator.HandleReport")
+		log.Fatal("[Reporting] fail to call Coordinator.HandleReport")
 	}
 }
 
 // 等待，暂定为 1s
 func doWaitTask() {
-	log.Println("[Waiting]: all tasks working, wait for a while...")
+	log.Println("[Waiting] all tasks working, wait for a while...")
 	time.Sleep(1 * time.Second)
 }
 

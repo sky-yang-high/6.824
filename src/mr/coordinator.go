@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"net/rpc"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -115,8 +117,7 @@ func (c *Coordinator) Schedule() {
 		if c.bitm.isAllSet() {
 			switch c.phase {
 			case Mapping:
-				c.initExitPhase() //现在只实现 map
-				//c.initReducePhase()
+				c.initReducePhase()
 			case Reducing:
 				c.initExitPhase()
 			case Exitting:
@@ -124,7 +125,6 @@ func (c *Coordinator) Schedule() {
 			}
 		}
 	}
-
 }
 
 // 初始化为 mapPhase，把 files 创建为 task，
@@ -132,10 +132,10 @@ func (c *Coordinator) initMapPhase() {
 	log.Println("[initMap] initializing....")
 	for i := 0; i < len(c.files); i++ {
 		t := &Task{
-			Type:     MapTask,
-			TaskId:   c.nextTaskid,
-			NReduce:  c.nReduce,
-			FileName: c.files[i],
+			Type:      MapTask,
+			TaskId:    c.nextTaskid,
+			NReduce:   c.nReduce,
+			FileNames: []string{c.files[i]},
 		}
 		c.tasks[c.nextTaskid] = t
 		c.nextTaskid++
@@ -147,9 +147,55 @@ func (c *Coordinator) initMapPhase() {
 	}
 }
 
-// todo: 初始化为 reducePhase
+// 初始化为 reducePhase，把相同 hash 后缀的 file 创建为一个 task(即-0.txt为一个task，-1.txt为另一个)
 func (c *Coordinator) initReducePhase() {
+	log.Println("[initRedice] initializing...")
+	c.phase = Reducing
+	fgroup := selectReduceFiles(c.nReduce)
 
+	// 重置 tasks
+	c.tasks = make(map[int]*Task)
+	c.nextAssignid = 0
+	c.nextTaskid = 0
+	for i := 0; i < len(fgroup); i++ {
+		t := &Task{
+			Type:      ReduceTask,
+			TaskId:    c.nextTaskid,
+			NReduce:   c.nReduce,
+			FileNames: fgroup[i],
+		}
+		c.tasks[c.nextTaskid] = t
+		c.nextTaskid++
+	}
+
+	//重置 bitmap
+	c.bitm.clear()
+	for i := c.nReduce; i < defaultBitSize*2; i++ {
+		c.bitm.set(uint(i))
+	}
+}
+
+// 把所有以 mr-tmp-x-y.txt 的文件名，按 y 汇合为 nreduce 组
+func selectReduceFiles(nReduce int) [][]string {
+	fgroup := make([][]string, nReduce)
+	pwd, _ := os.Getwd()
+	files, _ := os.ReadDir(pwd)
+	for _, f := range files {
+		if f.IsDir() {
+			continue
+		}
+		fName := f.Name()
+		if strings.HasPrefix(fName, "mr-tmp-") {
+			sepIdx := strings.LastIndex(fName, "-")
+			pointIdx := strings.LastIndex(fName, ".")
+			idx, err := strconv.Atoi(fName[sepIdx+1 : pointIdx])
+			if err != nil {
+				log.Fatalln("[selectReduce] fail to convert string to index")
+			}
+			fgroup[idx] = append(fgroup[idx], fName)
+		}
+	}
+	return fgroup
 }
 
 func (c *Coordinator) initExitPhase() {
@@ -169,7 +215,7 @@ func (c *Coordinator) AssignTask(hreply *HeartReply) {
 	// * 然后，跳转到下一个任务的位置，如果有任务完成，则从环上移走该任务
 	// * 可以发现，如果某个任务第一次被分配出去后，worker 挂了，会在下一轮重新分配给其他 worker
 	// * 难点在于跳转到下一个环的位置，要求 bitmap 提供接口
-	defer log.Println("[Assign] assigned task: ", hreply.FileName)
+	defer log.Println("[Assign] assigned task: ", hreply.FileNames)
 
 	// 告知每个 worker exit
 	if c.phase == Exitting {
