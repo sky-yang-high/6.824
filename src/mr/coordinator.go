@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/rpc"
 	"os"
+	"time"
 )
 
 type PhaseType int
@@ -15,6 +16,8 @@ const (
 	Reducing
 	Exitting
 )
+
+var defaultBitSize = 2
 
 // Coordinator 的定义
 type Coordinator struct {
@@ -31,6 +34,7 @@ type Coordinator struct {
 	nextAssignid int            //下一个分配给 worker 的 task  id
 	heartCh      chan heartMsg  //worker 心跳 的 chan
 	reportCh     chan reportMsg // worker report 的 chan
+	exitch       chan struct{}  //用于终止退出的 chan
 }
 
 type heartMsg struct {
@@ -53,10 +57,11 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		done:    make(chan struct{}),
 		phase:   Mapping,
 
-		bitm:     &bitmap{}, //todo，改为设置初始大小和容量
+		bitm:     NewBitMap(uint(defaultBitSize)),
 		tasks:    map[int]*Task{},
 		heartCh:  make(chan heartMsg),
 		reportCh: make(chan reportMsg),
+		exitch:   make(chan struct{}),
 	}
 
 	// 启动两个后台协程，一个接收 rpc 请求，一个处理任务
@@ -93,7 +98,7 @@ func (c *Coordinator) HandleReport(rreq *ReportRequest, rreply *ReportReply) err
 func (c *Coordinator) Schedule() {
 	c.initMapPhase()
 
-	log.Println("[Schedule]: assigning tasks")
+	log.Println("[Schedule] assigning tasks")
 	for {
 		select {
 		case hmsg := <-c.heartCh:
@@ -102,6 +107,9 @@ func (c *Coordinator) Schedule() {
 		case rmsg := <-c.reportCh:
 			c.AcceptReport(rmsg.rreq)
 			rmsg.ok <- struct{}{}
+		case <-c.exitch:
+			log.Println("[Schedule] Coordinator successfully exit ")
+			return
 		}
 		// 检查 c.bitm 是否全为1，若是，则表示当前阶段结束，转下一阶段
 		if c.bitm.isAllSet() {
@@ -132,6 +140,11 @@ func (c *Coordinator) initMapPhase() {
 		}
 		c.tasks[c.nextTaskid] = t
 	}
+
+	//把 bitmap 中额外的位置置为1
+	for pos := len(c.files); pos < defaultBitSize*8; pos++ {
+		c.bitm.set(uint(pos))
+	}
 }
 
 // todo: 初始化为 reducePhase
@@ -139,9 +152,14 @@ func (c *Coordinator) initReducePhase() {
 
 }
 
-// todo: 初始化为 exitPhase
 func (c *Coordinator) initExitPhase() {
-	// 启动一个定时器，时间到达后，c.schedule 退出
+	c.phase = Exitting
+	c.bitm.clear()
+	go func() {
+		// 启动一个定时器，时间到达后，c.schedule 退出
+		time.Sleep(5 * time.Second)
+		c.exitch <- struct{}{}
+	}()
 }
 
 // 为心跳请求分配 task
@@ -159,6 +177,10 @@ func (c *Coordinator) AssignTask(hreply *HeartReply) {
 	}
 
 	id := c.bitm.findFirstZeroAfter(c.nextAssignid)
+	if id == -1 {
+		hreply.Type = WaitTask
+		return
+	}
 	c.nextAssignid = id + 1
 	t := c.tasks[id]
 
@@ -170,7 +192,7 @@ func (c *Coordinator) AcceptReport(rreq *ReportRequest) {
 	// * 实现思路：把 bitmap 中对应位置1，并从 tasks 中移除对应的 task
 	log.Println("[Accept] accept task id: ", rreq.TaskId)
 
-	c.bitm.set(rreq.TaskId, 1)
+	c.bitm.set(uint(rreq.TaskId))
 	delete(c.tasks, rreq.TaskId)
 }
 
