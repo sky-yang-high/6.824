@@ -174,7 +174,7 @@ func doReport(t *Task) {
 
 // 等待，暂定为 3s( 1s 太短了)
 func doWaitTask() {
-	log.Println("[Waiting] all tasks working, wait for a while...")
+	//log.Println("[Waiting] all tasks working, wait for a while...")
 	time.Sleep(3 * time.Second)
 }
 

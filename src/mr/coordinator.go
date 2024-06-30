@@ -16,11 +16,12 @@ type PhaseType int
 const (
 	Mapping PhaseType = iota
 	Reducing
-	Exitting
+	Exiting
 )
 
-var (
+const (
 	defaultTimeout = 6.0 //jobcout(见jobcount.go) 的最大时延是5s，超时时间比它长一点即可
+	exitWaitTime   = 3   //退出时，等待时间
 )
 
 // Coordinator 的定义
@@ -80,8 +81,8 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 func (c *Coordinator) HandleHeartBeat(hreq *HeartRequset, hreply *HeartReply) error {
 	msg := heartMsg{hreply: hreply, ok: make(chan struct{})}
 
-	c.heartCh <- msg
-	<-msg.ok
+	c.heartCh <- msg //转到c.Schedule()
+	<-msg.ok         //等待 c.Schedule()
 
 	return nil
 }
@@ -91,8 +92,8 @@ func (c *Coordinator) HandleHeartBeat(hreq *HeartRequset, hreply *HeartReply) er
 func (c *Coordinator) HandleReport(rreq *ReportRequest, rreply *ReportReply) error {
 	msg := reportMsg{rreq: rreq, ok: make(chan struct{})}
 
-	c.reportCh <- msg
-	<-msg.ok
+	c.reportCh <- msg //转到c.Schedule()
+	<-msg.ok          //等待 c.Schedule()
 
 	return nil
 }
@@ -106,10 +107,10 @@ func (c *Coordinator) Schedule() {
 		select {
 		case hmsg := <-c.heartCh:
 			c.AssignTask(hmsg.hreply)
-			hmsg.ok <- struct{}{}
+			hmsg.ok <- struct{}{} //转到 c.HandleHeartBeat()
 		case rmsg := <-c.reportCh:
 			c.AcceptReport(rmsg.rreq)
-			rmsg.ok <- struct{}{}
+			rmsg.ok <- struct{}{} //转到 c.HandleReport()
 		case <-c.exitch:
 			//log.Println("[Schedule] Coordinator successfully exit ")
 			return
@@ -121,8 +122,9 @@ func (c *Coordinator) Schedule() {
 				c.initReducePhase()
 			case Reducing:
 				c.initExitPhase()
-			case Exitting:
-				// ! 不会执行到这里，因为initExit 时应该吧 bitm clear
+			case Exiting:
+				// ! 不会执行到这里，因为initExit 时应该把 bitm clear
+				panic("[Schedule] unexpected error when exiting")
 			}
 		}
 	}
@@ -131,6 +133,7 @@ func (c *Coordinator) Schedule() {
 // 初始化为 mapPhase，把 files 创建为 task，
 func (c *Coordinator) initMapPhase() {
 	//log.Println("[initMap] initializing....")
+	c.phase = Mapping
 	for i := 0; i < len(c.files); i++ {
 		t := &Task{
 			Type:      MapTask,
@@ -141,14 +144,10 @@ func (c *Coordinator) initMapPhase() {
 		c.tasks[c.nextTaskid] = t
 		c.nextTaskid++
 	}
-
-	// //把 bitmap 中额外的位置置为1
-	// for pos := len(c.files); pos < defaultBitSize*8; pos++ {
-	// 	c.bitm.set(uint(pos))
-	// }
 }
 
-// 初始化为 reducePhase，把相同 hash 后缀的 file 创建为一个 task(即-0.txt为一个task，-1.txt为另一个)
+// 初始化为 reducePhase，把相同 hash 后缀的 file 创建为一个 task
+// 即*-0.txt为一个task，*-1.txt为另一个
 func (c *Coordinator) initReducePhase() {
 	//log.Println("[initRedice] initializing...")
 	c.phase = Reducing
@@ -169,13 +168,8 @@ func (c *Coordinator) initReducePhase() {
 		c.nextTaskid++
 	}
 
+	//原先的 bitm 是按 len(files)分配的，需要重新分配
 	c.bitm = NewBitMap(uint(c.nReduce))
-
-	// //重置 bitmap
-	// c.bitm.clear()
-	// for i := c.nReduce; i < defaultBitSize*8; i++ {
-	// 	c.bitm.set(uint(i))
-	// }
 }
 
 // 把所有以 mr-tmp-x-y.txt 的文件名，按 y 汇合为 nreduce 组
@@ -201,14 +195,14 @@ func selectReduceFiles(nReduce int) [][]string {
 	return fgroup
 }
 
+// 初始化为 Exiting 阶段，等待一段时间后，c.Schedule 退出，c.Done返回 true
 func (c *Coordinator) initExitPhase() {
-	c.phase = Exitting
+	c.phase = Exiting
 	c.bitm.clear()
 	go func() {
-		// 启动一个定时器，时间到达后，c.schedule 退出
-		time.Sleep(2 * time.Second)
-		c.exitch <- struct{}{}
-		c.done <- struct{}{}
+		time.Sleep(time.Duration(exitWaitTime) * time.Second)
+		c.exitch <- struct{}{} //转到c.Schedule()
+		c.done <- struct{}{}   //转到c.Done()
 	}()
 }
 
@@ -216,11 +210,11 @@ func (c *Coordinator) initExitPhase() {
 func (c *Coordinator) AssignTask(hreply *HeartReply) {
 	// * 实现思路：所有的 task 放置在一个环上，每次把环上当前位置的 task 分配出去
 	// * 然后，跳转到下一个任务的位置，如果有任务完成，则从环上移走该任务
-	// * 可以发现，如果某个任务第一次被分配出去后，worker 挂了，会在下一轮重新分配给其他 worker
-	// * 难点在于跳转到下一个环的位置，要求 bitmap 提供接口
+	// * 显然，如果某个任务第一次被分配出去后，worker 挂了，会在下一轮重新分配给其他 worker
+	// * 即能够确保每个 task 都会被完成
 
 	// 告知每个 worker exit
-	if c.phase == Exitting || len(c.tasks) == 0 {
+	if c.phase == Exiting {
 		hreply.Type = ExitTask
 		return
 	}
@@ -233,9 +227,8 @@ func (c *Coordinator) AssignTask(hreply *HeartReply) {
 		return
 	}
 
-	//第一次被分配
 	if c.tasks[id].StartTime.IsZero() {
-		c.tasks[id].StartTime = time.Now()
+		c.tasks[id].StartTime = time.Now() //第一次被分配
 	} else if time.Since(c.tasks[id].StartTime).Seconds() > defaultTimeout {
 		c.tasks[id].StartTime = time.Now() //超时了，重新分配
 	} else {
@@ -247,6 +240,7 @@ func (c *Coordinator) AssignTask(hreply *HeartReply) {
 	t := c.tasks[id]
 
 	hreply.Task = *t //? 或许这里应该减少一次拷贝?
+	// 下面的 log，如果希望把 fileNames 输出，是不能在开头用 defer 的
 	//log.Println("[Assign] assigned task: ", hreply.FileNames)
 }
 
