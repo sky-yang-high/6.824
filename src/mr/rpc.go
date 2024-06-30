@@ -9,6 +9,7 @@ package mr
 import (
 	"os"
 	"strconv"
+	"time"
 )
 
 // Add your RPC definitions here.
@@ -24,10 +25,11 @@ const (
 
 // 具体的 task 定义
 type Task struct {
-	Type      TaskType //任务类型
-	TaskId    int      //task 的 id
-	NReduce   int      //用于 hash
-	FileNames []string //task 的文件
+	Type      TaskType  //任务类型
+	TaskId    int       //task 的 id
+	NReduce   int       //用于 hash
+	FileNames []string  //task 的文件
+	StartTime time.Time //上一次被分配的时间，用于超时重分配
 }
 
 // 心跳请求，在 worker 有空时发送

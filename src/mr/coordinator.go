@@ -19,23 +19,24 @@ const (
 	Exitting
 )
 
-var defaultBitSize = 2
+var (
+	defaultTimeout = 6.0 //jobcout(见jobcount.go) 的最大时延是5s，超时时间比它长一点即可
+)
 
 // Coordinator 的定义
 type Coordinator struct {
 	files   []string      //需要进行 map 的 files
-	nReduce int           //用于 map 的 hash
+	nReduce int           //用于 map 和 reduce 的 hash 模数
 	done    chan struct{} //是否(map 和 reduce)任务都完成了
 	phase   PhaseType     //当前处于哪个阶段
 
 	bitm *bitmap //维护 task 的完成情况，和tasks应该同步，
 	// 即若id处于tasks中，则在bitm 中置为一定为0
-	// 另外，我们这里的 tasks 不超过 max(len(files),nReduce)，因此 bitm 只需要一个 uint32
 	tasks        map[int]*Task  //需要处理和正在处理的tasks
 	nextTaskid   int            //下一个task创建时分配的id
-	nextAssignid int            //下一个分配给 worker 的 task  id
+	nextAssignid int            //下一个分配给worker的task的id
 	heartCh      chan heartMsg  //worker 心跳 的 chan
-	reportCh     chan reportMsg // worker report 的 chan
+	reportCh     chan reportMsg //worker report 的 chan
 	exitch       chan struct{}  //用于终止退出的 chan
 }
 
@@ -59,7 +60,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		done:    make(chan struct{}),
 		phase:   Mapping,
 
-		bitm:     NewBitMap(uint(defaultBitSize)),
+		bitm:     NewBitMap(uint(len(files))),
 		tasks:    map[int]*Task{},
 		heartCh:  make(chan heartMsg),
 		reportCh: make(chan reportMsg),
@@ -100,7 +101,7 @@ func (c *Coordinator) HandleReport(rreq *ReportRequest, rreply *ReportReply) err
 func (c *Coordinator) Schedule() {
 	c.initMapPhase()
 
-	log.Println("[Schedule] assigning tasks")
+	//log.Println("[Schedule] assigning tasks")
 	for {
 		select {
 		case hmsg := <-c.heartCh:
@@ -110,7 +111,7 @@ func (c *Coordinator) Schedule() {
 			c.AcceptReport(rmsg.rreq)
 			rmsg.ok <- struct{}{}
 		case <-c.exitch:
-			log.Println("[Schedule] Coordinator successfully exit ")
+			//log.Println("[Schedule] Coordinator successfully exit ")
 			return
 		}
 		// 检查 c.bitm 是否全为1，若是，则表示当前阶段结束，转下一阶段
@@ -129,7 +130,7 @@ func (c *Coordinator) Schedule() {
 
 // 初始化为 mapPhase，把 files 创建为 task，
 func (c *Coordinator) initMapPhase() {
-	log.Println("[initMap] initializing....")
+	//log.Println("[initMap] initializing....")
 	for i := 0; i < len(c.files); i++ {
 		t := &Task{
 			Type:      MapTask,
@@ -141,15 +142,15 @@ func (c *Coordinator) initMapPhase() {
 		c.nextTaskid++
 	}
 
-	//把 bitmap 中额外的位置置为1
-	for pos := len(c.files); pos < defaultBitSize*8; pos++ {
-		c.bitm.set(uint(pos))
-	}
+	// //把 bitmap 中额外的位置置为1
+	// for pos := len(c.files); pos < defaultBitSize*8; pos++ {
+	// 	c.bitm.set(uint(pos))
+	// }
 }
 
 // 初始化为 reducePhase，把相同 hash 后缀的 file 创建为一个 task(即-0.txt为一个task，-1.txt为另一个)
 func (c *Coordinator) initReducePhase() {
-	log.Println("[initRedice] initializing...")
+	//log.Println("[initRedice] initializing...")
 	c.phase = Reducing
 	fgroup := selectReduceFiles(c.nReduce)
 
@@ -168,11 +169,13 @@ func (c *Coordinator) initReducePhase() {
 		c.nextTaskid++
 	}
 
-	//重置 bitmap
-	c.bitm.clear()
-	for i := c.nReduce; i < defaultBitSize*8; i++ {
-		c.bitm.set(uint(i))
-	}
+	c.bitm = NewBitMap(uint(c.nReduce))
+
+	// //重置 bitmap
+	// c.bitm.clear()
+	// for i := c.nReduce; i < defaultBitSize*8; i++ {
+	// 	c.bitm.set(uint(i))
+	// }
 }
 
 // 把所有以 mr-tmp-x-y.txt 的文件名，按 y 汇合为 nreduce 组
@@ -203,7 +206,7 @@ func (c *Coordinator) initExitPhase() {
 	c.bitm.clear()
 	go func() {
 		// 启动一个定时器，时间到达后，c.schedule 退出
-		time.Sleep(5 * time.Second)
+		time.Sleep(2 * time.Second)
 		c.exitch <- struct{}{}
 		c.done <- struct{}{}
 	}()
@@ -217,27 +220,40 @@ func (c *Coordinator) AssignTask(hreply *HeartReply) {
 	// * 难点在于跳转到下一个环的位置，要求 bitmap 提供接口
 
 	// 告知每个 worker exit
-	if c.phase == Exitting {
+	if c.phase == Exitting || len(c.tasks) == 0 {
 		hreply.Type = ExitTask
 		return
 	}
 
 	id := c.bitm.findFirstZeroAfter(c.nextAssignid)
+
+	// 没有要分配的任务
 	if id == -1 {
 		hreply.Type = WaitTask
 		return
 	}
+
+	//第一次被分配
+	if c.tasks[id].StartTime.IsZero() {
+		c.tasks[id].StartTime = time.Now()
+	} else if time.Since(c.tasks[id].StartTime).Seconds() > defaultTimeout {
+		c.tasks[id].StartTime = time.Now() //超时了，重新分配
+	} else {
+		hreply.Type = WaitTask //还没超时，不需要重新分配
+		return
+	}
+
 	c.nextAssignid = id + 1
 	t := c.tasks[id]
 
 	hreply.Task = *t //? 或许这里应该减少一次拷贝?
-	log.Println("[Assign] assigned task: ", hreply.FileNames)
+	//log.Println("[Assign] assigned task: ", hreply.FileNames)
 }
 
 // 接收上报信息
 func (c *Coordinator) AcceptReport(rreq *ReportRequest) {
 	// * 实现思路：把 bitmap 中对应位置1，并从 tasks 中移除对应的 task
-	log.Println("[Accept] accept task id: ", rreq.TaskId)
+	//log.Println("[Accept] accept task id: ", rreq.TaskId)
 
 	c.bitm.set(uint(rreq.TaskId))
 	delete(c.tasks, rreq.TaskId)

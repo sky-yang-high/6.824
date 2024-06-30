@@ -71,7 +71,7 @@ func doMapTask(t *Task, mapf func(string, string) []KeyValue) {
 	// * 把中间结果，根据 ihash(key) % NReduce，写入不同的文件中，以 json 格式
 	// * 最后上报给 Coordinator
 
-	log.Printf("[Mapping] task-%d, %s\n", t.TaskId, t.FileNames[0])
+	//log.Printf("[Mapping] task-%d, %s\n", t.TaskId, t.FileNames[0])
 
 	file, err := os.Open(t.FileNames[0]) //对于 map 任务，file只有一个文件
 	if err != nil {
@@ -91,7 +91,7 @@ func doMapTask(t *Task, mapf func(string, string) []KeyValue) {
 
 	for i := 0; i < t.NReduce; i++ {
 		ofName := "mr-tmp-" + strconv.Itoa(t.TaskId) + "-" + strconv.Itoa(i) + ".txt"
-		of, err := os.OpenFile(ofName, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0666)
+		of, err := os.Create(ofName) //直接用 create，避免多次测试导致结果错误
 		if err != nil {
 			log.Fatalln("[Mapping] fail to write to file: ", ofName, err)
 		}
@@ -110,7 +110,7 @@ func doReduceTask(t *Task, reducef func(string, []string) string) {
 	// * 实现思路：读取 task 中的几个文件，用json 解码得到很多 kv对
 	// * 然后排序，参照 mrsequential.go 中的思路，批量处理相同的 key，结果重新写入文件中(或许这里可以不需要重新hash)
 	// * 最后上报给 Coordinator 即可
-	log.Printf("[Reducing] task-%d, %v", t.TaskId, t.FileNames)
+	//log.Printf("[Reducing] task-%d, %v", t.TaskId, t.FileNames)
 	var kvs []KeyValue
 	kv := KeyValue{}
 	for _, fn := range t.FileNames {
@@ -172,10 +172,10 @@ func doReport(t *Task) {
 	}
 }
 
-// 等待，暂定为 1s
+// 等待，暂定为 3s( 1s 太短了)
 func doWaitTask() {
 	log.Println("[Waiting] all tasks working, wait for a while...")
-	time.Sleep(1 * time.Second)
+	time.Sleep(3 * time.Second)
 }
 
 // todo
