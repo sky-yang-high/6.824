@@ -19,8 +19,10 @@ package raft
 
 import (
 	//	"bytes"
+	"math/rand"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	//	"6.824/labgob"
 	"6.824/labrpc"
@@ -47,6 +49,14 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+type ElectionState int
+
+const (
+	Follower  ElectionState = iota
+	Candidate ElectionState = iota
+	Leader    ElectionState = iota
+)
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -59,16 +69,35 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	// 持久性状态
+	currentTerm int       // 节点已知的最新的任期 (初始化时为0，单调递增)
+	votedFor    *int      // 当前任期内投给票的candidateId，如果没有则为空(用指针是因为节点编号从0开始)
+	logs        []RaftLog // 日志条目，每个条目包含命令和leader收到该条目的任期
+
+	// 易矢性状态
+	commitIndex int // 已知已提交的最高的日志条目的索引 (初值为0，单调递增)
+	lastApplied int // 已知被应用到状态机的最高的日志条目的索引 (初值为0，单调递增)
+
+	// leader 的易矢性状态，每次选举后重新初始化
+	nextIndex  []int // 对每个节点，发送到该节点的下一日志条目的索引
+	matchIndex []int // 对于每个，已知的已经复制到该节点的最高日志条目的索引
+
+	// 其他添加的状态
+	electionState ElectionState // 当前本节点的状态(三个枚举值，Follower, Candidate, Leader)
+	voteRpcFlag   bool          // ticker过程收到投票rpc的标志
+	appendRpcFlag bool          // ticker过程收到日志rpc的标志
+}
+
+type RaftLog struct {
+	operation string // 日志条目的命令，若为空则表示心跳信息
+	term      int    // 该日志被leader接收时的任期
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
-	// Your code here (2A).
-	return term, isleader
+	// (2A)
+	return rf.currentTerm, rf.electionState == Leader
 }
 
 // save Raft's persistent state to stable storage,
@@ -127,17 +156,40 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+
+	// 2A
+	Term         int // 发起投票的 candinate
+	CandinateId  int // 发起投票的 candinate 的 id
+	LastLogIndex int // 发起投票的 candinate 的最后日志条目的索引值
+	LastLogTerm  int // 发起投票的 candinate 的最后日志条目的任期号
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (2A).
+	// 2A
+	Term        int  // 投票者的任期号
+	VoteGranted bool // 是否投给该 candinate
 }
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	// 2A
+	reply.Term = rf.currentTerm
+	if rf.currentTerm > args.Term {
+		reply.VoteGranted = false
+		return
+	}
+
+	if rf.votedFor != nil {
+		reply.VoteGranted = false
+		return
+	}
+
+	// todo: 再看一遍5.2和5.4的内容，然后再写这部分逻辑
+	if rf.logs[len(rf.logs)-1].
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -216,13 +268,64 @@ func (rf *Raft) killed() bool {
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
 func (rf *Raft) ticker() {
-	for rf.killed() == false {
-
+	for !rf.killed() {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
 
+		// 开始超时选举前，重置标志位
+		// todo: 加锁，或者使用其他方式实现
+		rf.voteRpcFlag = false
+		rf.appendRpcFlag = false
+
+		// todo: 超时选举时间，后面需要调整
+		sleepDuration := 100 + rand.Int31()%100
+		time.Sleep(time.Duration(sleepDuration) * time.Millisecond)
+
+		// 如果中间收到过 投票rpc/日志rpc，重新下一轮ticker
+		if rf.voteRpcFlag || rf.appendRpcFlag {
+			continue
+		}
+
+		// 没有收到
+		DPrintf("follower %d, term %d, turn into candinate, start request vote", rf.me, rf.currentTerm)
+		// 变更状态为 candinate，然后发起投票
+		rf.changeState(Candidate)
+		for i := 0; i < len(rf.peers); i++ {
+			reqs := make([]*RequestVoteArgs, len(rf.peers))
+			replys := make([]*RequestVoteReply, len(rf.peers))
+			oks := make([]bool, len(rf.peers))
+
+			go func(i int) {
+				// 不需要跳过自己，投票自己肯定投给自己
+				// if rf.me == i { // 跳过自己
+				// 	return
+				// }
+				req := &RequestVoteArgs{}
+				reply := &RequestVoteReply{}
+				ok := rf.sendRequestVote(i, req, reply)
+
+				reqs[i] = req
+				replys[i] = reply
+				oks[i] = ok
+			}(i)
+		}
+
+		// 处理投票结果
+		// 如果未获得半数以上票，则重新等待下一轮选举
+		// 否则，成为 leader，更新 leader 状态并广播心跳
+		// todo: 待实现，先实现 vote rpc
+
 	}
+}
+
+// 变更状态为预期状态
+func (rf *Raft) changeState(expectedState ElectionState) {
+	// follower -> candinate
+	// candinate -> follower
+	// candinate -> leader
+	// leader -> follower
+	// todo: 完成具体细节
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -242,6 +345,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	// 2A
+	rf.currentTerm = 0
+	rf.votedFor = nil
+
+	rf.electionState = Follower
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
