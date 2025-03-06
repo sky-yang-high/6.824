@@ -26,6 +26,7 @@ import (
 
 	//	"6.824/labgob"
 	"6.824/labrpc"
+	"k8s.io/klog/v2"
 )
 
 // as each Raft peer becomes aware that successive log entries are
@@ -79,14 +80,14 @@ type Raft struct {
 	lastApplied int // 已知被应用到状态机的最高的日志条目的索引 (初值为0，单调递增)
 
 	// leader 的易矢性状态，每次选举后重新初始化
-	nextIndex   []int    // 对每个节点，发送到该节点的下一日志条目的索引
-	matchIndex  []int    // 对于每个，已知的已经复制到该节点的最高日志条目的索引
-	heartBeatCh chan int // 控制定时心跳的channel，退出leader状态时，关闭，进入leader状态时，重新初始化
+	nextIndex   []int         // 对每个节点，发送到该节点的下一日志条目的索引
+	matchIndex  []int         // 对于每个，已知的已经复制到该节点的最高日志条目的索引
+	heartBeatCh chan struct{} // 控制定时心跳的channel，退出leader状态时，关闭，进入leader状态时，重新初始化
 
 	// 其他添加的状态
 	electionState ElectionState // 当前本节点的状态(三个枚举值，Follower, Candidate, Leader)
-	voteRpcFlag   bool          // ticker过程收到投票rpc的标志
-	appendRpcFlag bool          // ticker过程收到日志rpc的标志
+	voteRPCFlag   bool          // ticker过程收到投票rpc的标志
+	appendRPCFlag bool          // ticker过程收到日志rpc的标志
 }
 
 type RaftLog struct {
@@ -98,6 +99,8 @@ type RaftLog struct {
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 	// (2A)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	return rf.currentTerm, rf.electionState == Leader
 }
 
@@ -181,14 +184,24 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	defer func() {
 		reply.Term = rf.currentTerm
 	}()
-	rf.voteRpcFlag = true
 
+	rf.mu.Lock()
+	rf.voteRPCFlag = true
+	rf.mu.Unlock()
+
+	rf.mu.Lock()
 	if rf.currentTerm < args.Term {
-		// todo: 这里非常需要加锁，以及逻辑顺序需要确认
+		// 更新任期，并重置投票
 		rf.currentTerm = args.Term
+		rf.votedFor = nil
 		if rf.electionState != Follower {
+			rf.mu.Unlock()
 			rf.changeState(Follower)
+		} else {
+			rf.mu.Unlock()
 		}
+	} else {
+		rf.mu.Unlock()
 	}
 
 	// 自己任期号更大
@@ -214,7 +227,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	// 同意投票
-	DPrintf("[Vote] server %d term %d vote for candidate %d term %d", rf.me, rf.currentTerm, args.CandidateId, args.Term)
+	klog.V(2).Infof("[Vote] server %d term %d vote for candidate %d term %d", rf.me, rf.currentTerm, args.CandidateId, args.Term)
 	rf.mu.Lock()
 	votedFor := args.CandidateId
 	rf.votedFor = &votedFor
@@ -276,8 +289,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Term = rf.currentTerm
 	}()
 
-	rf.appendRpcFlag = true
-	// todo: 考虑把所有服务器都遵守的规则单独整合为函数
+	rf.mu.Lock()
+	rf.appendRPCFlag = true
+	rf.mu.Unlock()
+
 	if rf.currentTerm < args.Term {
 		rf.currentTerm = args.Term
 		// 当前不是 follower，且收到更高任期的信号，则转为 follower
@@ -345,84 +360,106 @@ func (rf *Raft) ticker() {
 		// time.Sleep().
 
 		// 开始超时选举前，重置标志位
-		// todo: 加锁，或者使用其他方式实现
-		// * 可以用 ch 实现，感觉会更好，不过多个flag的情况又怎么处理呢
-		rf.voteRpcFlag = false
-		rf.appendRpcFlag = false
+		// todo: 考虑用 ch 实现，感觉会更好，不过多个flag的情况又怎么处理呢
+		rf.mu.Lock()
+		rf.voteRPCFlag = false
+		rf.appendRPCFlag = false
+		rf.mu.Unlock()
 
 		// todo: 超时选举时间，后面需要调整
 		sleepDuration := 100 + rand.Int31()%100
 		time.Sleep(time.Duration(sleepDuration) * time.Millisecond)
 
 		// 如果中间收到过 投票rpc/日志rpc，重新下一轮ticker
-		if rf.voteRpcFlag || rf.appendRpcFlag {
+		rf.mu.Lock()
+		if rf.voteRPCFlag || rf.appendRPCFlag {
+			rf.mu.Unlock()
 			continue
 		}
+		rf.mu.Unlock()
 
 		// 没有收到, 变更状态为 candidate，然后发起投票
-		// todo: 开始选举后，也要重置超时计数器，即下面的过程也应该并发进行
-		DPrintf("[Vote] follower %d, term %d, turn into candidate, start request vote", rf.me, rf.currentTerm)
+		// todo: 开始选举后，也要重置超时计数器，，避免选举过程超时，即下面的过程也应该并发进行
+		klog.V(2).Infof("[Vote] follower %d, term %d, turn into candidate, start request vote", rf.me, rf.currentTerm)
 		rf.changeState(Candidate)
+		candidateRequestVote(rf)
+	}
+}
 
-		replys := make([]*RequestVoteReply, len(rf.peers))
-		oks := make([]bool, len(rf.peers))
-		wg := &sync.WaitGroup{}
+// 候选人请求投票，不需要一直等待，获得多数选票即可
+func candidateRequestVote(rf *Raft) {
+	var mu sync.Mutex
+	var voteCountReached bool
+	ch := make(chan *RequestVoteReply, len(rf.peers))
 
-		for i := 0; i < len(rf.peers); i++ {
-			req := &RequestVoteArgs{
-				Term:         rf.currentTerm,
-				CandidateId:  rf.me,
-				LastLogTerm:  rf.logs[len(rf.logs)-1].Term,
-				LastLogIndex: len(rf.logs) - 1,
-			}
-
-			wg.Add(1)
-			go func(i int) {
-				defer wg.Done()
-				// 不需要跳过自己，投票自己肯定投给自己
-				reply := &RequestVoteReply{}
-				ok := rf.sendRequestVote(i, req, reply)
-
-				replys[i] = reply
-				oks[i] = ok
-			}(i)
-		}
-		wg.Wait()
-
-		// 处理投票结果
-		// 如果未获得半数以上票，则重新等待下一轮选举
-		// 否则，成为 leader，更新 leader 状态并广播心跳
-		// todo: 待实现，先实现 vote rpc
-		voteCount := 0
-		for i := 0; i < len(replys)-1; i++ {
-			if oks[i] && replys[i].VoteGranted {
-				voteCount += 1
-			}
+	for i := 0; i < len(rf.peers); i++ {
+		req := &RequestVoteArgs{
+			Term:         rf.currentTerm,
+			CandidateId:  rf.me,
+			LastLogTerm:  rf.logs[len(rf.logs)-1].Term,
+			LastLogIndex: len(rf.logs) - 1,
 		}
 
-		// 获得半数以上选票，成为 leader
-		if voteCount >= (len(rf.peers)+1)/2 {
-			DPrintf("[Vote] candidate %d got %d vote, turn into leader", rf.me, voteCount)
-			rf.changeState(Leader)
+		go func(i int) {
+			// 不需要跳过自己，投票自己肯定投给自己
+			reply := &RequestVoteReply{}
+			ok := rf.sendRequestVote(i, req, reply)
 
-			// 假定成为 leader 过程不会被打断
-			for {
-				if rf.heartBeatCh == nil {
-					continue
+			if !ok {
+				reply.Term = rf.currentTerm
+				reply.VoteGranted = false
+			}
+
+			mu.Lock()
+			if !voteCountReached {
+				ch <- reply
+			}
+			mu.Unlock()
+		}(i)
+	}
+
+	// 处理投票结果
+	// 如果未获得半数以上票，则重新等待下一轮选举
+	// 否则，成为 leader，更新 leader 状态并广播心跳
+	var reply *RequestVoteReply
+	voteCount, totalCount := 0, 0
+
+	for {
+		select {
+		case reply = <-ch:
+			totalCount++
+			if reply.VoteGranted {
+				voteCount++
+				if voteCount >= (len(rf.peers)+1)/2 {
+					mu.Lock()
+					voteCountReached = true
+					// 确保后续不会在发送给ch
+					close(ch)
+					mu.Unlock()
+
+					klog.V(2).Infof("[Vote] candidate %d got %d vote, turn into leader", rf.me, voteCount)
+					rf.changeState(Leader)
+					// 假定成为 leader 过程不会被打断
+					for {
+						if rf.heartBeatCh == nil {
+							continue
+						}
+
+						// 阻塞 leader 自己的 ticker
+						<-rf.heartBeatCh
+						break
+					}
+					return
 				}
-
-				// 阻塞 leader 自己的 ticker
-				<-rf.heartBeatCh
-				break
 			}
-
-			DPrintf("[] leader %d term %d turn into follower", rf.me, rf.currentTerm)
-			continue
+		default:
+			if totalCount >= len(rf.peers) {
+				// 未获得半数以上选票, 退回 follower, 重启下一轮 ticker
+				klog.V(2).Infof("[Vote] candidate %d got %d vote, fail to turn into leader", rf.me, voteCount)
+				rf.changeState(Follower)
+				return
+			}
 		}
-
-		// 未获得半数以上选票, 退回 follower, 重启下一轮 ticker
-		DPrintf("[Vote] candidate %d got %d vote, fail to turn into leader", rf.me, voteCount)
-		rf.changeState(Follower)
 	}
 }
 
@@ -432,7 +469,6 @@ func (rf *Raft) changeState(expectedState ElectionState) {
 	// candidate -> follower
 	// candidate -> leader
 	// leader -> follower
-	// todo: 完成具体细节
 	switch expectedState {
 	case Follower:
 		changeStateToFollower(rf)
@@ -446,27 +482,33 @@ func (rf *Raft) changeState(expectedState ElectionState) {
 // 初始化，或者收到更高的 term 的 appendRPC
 func changeStateToFollower(rf *Raft) {
 	rf.mu.Lock()
+	oldState := rf.electionState
 	rf.electionState = Follower
 	if rf.heartBeatCh != nil {
 		close(rf.heartBeatCh)
-		rf.heartBeatCh = nil
 	}
+	klog.V(2).Infof("[StateChange] server %d term %d, oldState %d, change state to <Follower>", rf.me, rf.currentTerm, oldState)
 	rf.mu.Unlock()
 }
 
 // 选举超时时间到
 func changeStateToCandidate(rf *Raft) {
 	rf.mu.Lock()
+	oldState := rf.electionState
 	rf.currentTerm += 1
+	rf.votedFor = nil
 	rf.electionState = Candidate
+	klog.V(2).Infof("[StateChange] server %d term %d, oldState %d, change state to <Candidate>", rf.me, rf.currentTerm, oldState)
 	rf.mu.Unlock()
 }
 
 // 获得多数选票
 func changeStateToLeader(rf *Raft) {
 	rf.mu.Lock()
+	oldState := rf.electionState
 	rf.electionState = Leader
-	rf.heartBeatCh = make(chan int)
+	rf.heartBeatCh = make(chan struct{})
+	klog.V(2).Infof("[StateChange] server %d term %d, oldState %d, change state to <Leader>", rf.me, rf.currentTerm, oldState)
 	rf.mu.Unlock()
 
 	// 立即广播心跳一次
@@ -482,12 +524,12 @@ func changeStateToLeader(rf *Raft) {
 
 func (rf *Raft) HeartBeatOnTime() {
 	if rf.electionState != Leader {
-		DPrintf("[warning] server %d term %d is not leader, but try to heartbeat", rf.me, rf.currentTerm)
+		klog.V(1).Infof("[Warning] server %d term %d is not leader, but try to heartbeat", rf.me, rf.currentTerm)
 		return
 	}
 
 	heartBeatArgs := &AppendEntriesArgs{
-		Term:     0,
+		Term:     rf.currentTerm,
 		LeaderId: rf.me,
 	}
 	for {
@@ -498,6 +540,7 @@ func (rf *Raft) HeartBeatOnTime() {
 
 		select {
 		case <-rf.heartBeatCh:
+			rf.heartBeatCh = nil
 			return
 		default:
 			Broadcast(rf, heartBeatArgs)
@@ -505,7 +548,10 @@ func (rf *Raft) HeartBeatOnTime() {
 	}
 }
 
+// todo: 待完善，需要处理 reply。特别是更新 term
+// ! 暂时先不考虑接收 reply，后面需要改
 func Broadcast(rf *Raft, args *AppendEntriesArgs) []*AppendEntriesReply {
+	klog.V(3).Infof("[HeartBeat] leader %d, term %d broadcast heartBeat", rf.me, rf.currentTerm)
 	replys := make([]*AppendEntriesReply, len(rf.peers))
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
@@ -523,6 +569,25 @@ func Broadcast(rf *Raft, args *AppendEntriesArgs) []*AppendEntriesReply {
 		}(i)
 		replys[i] = reply
 	}
+
+	var success, fail []int
+	// for i := 0; i < len(rf.peers); i++ {
+	// 	if replys[i] == nil {
+	// 		if i == rf.me {
+	// 			continue
+	// 		}
+	// 		fail = append(fail, i)
+	// 		continue
+	// 	}
+
+	// 	if !replys[i].Success {
+	// 		fail = append(fail, i)
+	// 		continue
+	// 	}
+	// 	success = append(success, i)
+	// }
+
+	klog.V(3).Infof("[HeartBeat] leader %d, term %d broadcast heartBeat result is: success %v, fail %v", rf.me, rf.currentTerm, success, fail)
 	return replys
 }
 

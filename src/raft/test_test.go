@@ -9,17 +9,28 @@ package raft
 //
 
 import (
+	"flag"
 	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"k8s.io/klog/v2"
 )
 
 // The tester generously allows solutions to complete elections in one second
 // (much more than the paper's range of timeouts).
 const RaftElectionTimeout = 1000 * time.Millisecond
+
+func TestMain(m *testing.M) {
+	klog.InitFlags(nil)
+	flag.Parse()
+	defer klog.Flush()
+
+	m.Run()
+}
 
 func TestInitialElection2A(t *testing.T) {
 	servers := 3
@@ -62,26 +73,32 @@ func TestReElection2A(t *testing.T) {
 	leader1 := cfg.checkOneLeader()
 
 	// if the leader disconnects, a new one should be elected.
+	klog.V(1).Infof("[Test] leader1 %d disconnect", leader1)
 	cfg.disconnect(leader1)
 	cfg.checkOneLeader()
 
 	// if the old leader rejoins, that shouldn't
 	// disturb the new leader.
+	klog.V(1).Infof("[Test] leader1 %d try connect", leader1)
 	cfg.connect(leader1)
 	leader2 := cfg.checkOneLeader()
 
 	// if there's no quorum, no leader should
 	// be elected.
+	klog.V(1).Infof("[Test] leader2 %d disconnect", leader2)
 	cfg.disconnect(leader2)
+	klog.V(1).Infof("[Test] follower %d disconnect", (leader2+1)%servers)
 	cfg.disconnect((leader2 + 1) % servers)
 	time.Sleep(2 * RaftElectionTimeout)
 	cfg.checkNoLeader()
 
 	// if a quorum arises, it should elect a leader.
+	klog.V(1).Infof("[Test] follower %d try connect", (leader2+1)%servers)
 	cfg.connect((leader2 + 1) % servers)
 	cfg.checkOneLeader()
 
 	// re-join of last node shouldn't prevent leader from existing.
+	klog.V(1).Infof("[Test] leader2 %d try connect", leader2)
 	cfg.connect(leader2)
 	cfg.checkOneLeader()
 
