@@ -67,16 +67,24 @@ type Raft struct {
 	votedFor    int        // 当前任期内投票给谁，未投票置为-1
 	logs        []LogEntry // 日志条目
 
+	// 易矢性状态
+	commitIndex int // 最大的已提交的日志条目索引
+	lastApplied int // 最大的已应用到状态机的日志条目索引
+
+	// leader 的易矢性状态，每次选举后重新初始化
+	nextIndex  []int // 对每个节点，发送到该节点的下一个日志条目索引
+	matchIndex []int // 对每个节点，最大的已复制到该节点的日志条目索引，用于更新 commitIndex
+
 	// 其他
+	leaderId        int           // 记录 leader id
 	electionState   ElectionState // 节点当前状态
 	electionTicker  *time.Ticker  // 选举超时定时器
 	heartbeatTicker *time.Ticker  // 心跳定时器
-
 }
 
 type LogEntry struct {
-	Term    int    // leader 收到该时 log 的任期
-	Command string // 命令
+	Term    int         // leader 收到该时 log 的任期
+	Command interface{} // 命令
 }
 
 type ElectionState int
@@ -191,8 +199,14 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 }
 
 type AppendEntriesArgs struct {
+	// 2A
 	Term     int // leader 的任期号
 	LeaderId int // leader id
+	// 2B
+	PrevLogIndex int        // 前一个日志条目的索引
+	PrevLogTerm  int        // 前一个日志条目的任期
+	Entries      []LogEntry // 发送的日志条目，一次可发送多个来提高效率。心跳则为空
+	LeaderCommit int        // leader 的 commitIndex
 }
 type AppendEntriesReply struct {
 	Term    int  // 节点的任期号
@@ -242,13 +256,27 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
 	// Your code here (2B).
+	// 2B
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-	return index, term, isLeader
+	if rf.electionState != StateLeader {
+		return -1, -1, false
+	}
+
+	// 追加到自己的 logs 中，并向其他节点复制
+	rf.logs = append(rf.logs, LogEntry{
+		Term:    rf.currentTerm,
+		Command: command,
+	})
+
+	// todo: 调用 sendAppendEntries RPC 进行复制
+	go func() {
+
+	}()
+
+	return len(rf.logs) - 1, rf.currentTerm, true
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -312,7 +340,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	// 2A
 	rf.currentTerm = 0
-	rf.logs = []LogEntry{{Term: 0}}
+	rf.logs = []LogEntry{{Term: 0}} // 让 log entry 的初始索引为1
 	rf.electionState = StateFollower
 	rf.electionTicker = time.NewTicker(randomElectionOutTime())
 	rf.heartbeatTicker = time.NewTicker(randomHeartbeatTime())
