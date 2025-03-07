@@ -94,6 +94,7 @@ func tryRequestVote(rf *Raft) {
 				rf.currentTerm = reply.Term
 				rf.votedFor = -1
 				rf.changeState(StateFollower)
+				rf.electionTicker.Reset(randomElectionOutTime())
 				return
 			}
 			if !done && rf.currentTerm == reply.Term && reply.VoteGranted {
@@ -111,7 +112,8 @@ func tryRequestVote(rf *Raft) {
 		}(i)
 	}
 	// ? 这里如果没有获得多数选票，考虑是否要退回 follower
-	// 想了一下不退也可以，因为如果之后收到leader的心跳，follower/candidate处理没有差别
+	// 想了一下不退也可以，因为如果之后收到 RPC，follower/candidate处理没有差别
+	// 而如果没有收到，则在下次超时时还是进入 candidate 状态
 }
 
 // leader 定期广播心跳
@@ -121,8 +123,9 @@ func broadcastHeartbeat(rf *Raft) {
 
 	klog.V(3).Infof("{s%d t%d} [heart] broadcast heartbeat signal", rf.me, rf.currentTerm)
 	args := &AppendEntriesArgs{
-		Term:     rf.currentTerm,
-		LeaderId: rf.me,
+		Term:         rf.currentTerm,
+		LeaderId:     rf.me,
+		LeaderCommit: rf.commitIndex,
 	}
 
 	for i := 0; i < len(rf.peers); i++ {
@@ -135,7 +138,6 @@ func broadcastHeartbeat(rf *Raft) {
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
 
-				// todo: 或许还要考虑一下等于的情况
 				if rf.currentTerm < reply.Term {
 					klog.V(1).Infof("{s%d t%d} [heart] s%d send a higher t%d, backward to follower", rf.me, rf.currentTerm, i, reply.Term)
 					rf.currentTerm = reply.Term

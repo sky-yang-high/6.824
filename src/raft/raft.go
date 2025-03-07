@@ -80,6 +80,7 @@ type Raft struct {
 	electionState   ElectionState // 节点当前状态
 	electionTicker  *time.Ticker  // 选举超时定时器
 	heartbeatTicker *time.Ticker  // 心跳定时器
+	applyCh         chan ApplyMsg // apply 日志条目的通道，把已提交的日志条目发到这里来模拟在物理机上 apply 该 cmd
 }
 
 type LogEntry struct {
@@ -143,6 +144,17 @@ func (rf *Raft) changeState(expectedState ElectionState) {
 		rf.electionState = StateLeader
 		rf.electionTicker.Stop()
 		rf.heartbeatTicker.Reset(randomHeartbeatTime())
+		// 初始化日志相关数据
+		leaderInit(rf)
+	}
+}
+
+func leaderInit(rf *Raft) {
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+
+	for i := 0; i < len(rf.peers); i++ {
+		rf.nextIndex[i] = len(rf.logs)
 	}
 }
 
@@ -216,27 +228,75 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
-	klog.V(3).Infof("{s%d t%d} [rcv/log] ld%d t%d", rf.me, rf.currentTerm, args.LeaderId, args.Term)
-
-	if rf.currentTerm < args.Term {
-		rf.currentTerm = args.Term
-		rf.votedFor = -1
-		rf.changeState(StateFollower)
-		rf.electionTicker.Reset(randomElectionOutTime())
-		reply.Term = rf.currentTerm
-		return
-	}
+	// 注意用闭包而不是直接调用，不然Success的值一直都是false
+	defer func() {
+		klog.V(3).Infof("{s%d t%d} [rcv/log] ld%d t%d: %t; commitIndex %d", rf.me, rf.currentTerm, args.LeaderId, args.Term, reply.Success, rf.commitIndex)
+	}()
 
 	if rf.currentTerm > args.Term {
 		reply.Term = rf.currentTerm
 		return
 	}
 
-	// 2A 不考虑日志，只看心跳
+	if rf.currentTerm < args.Term {
+		rf.currentTerm = args.Term
+		rf.votedFor = -1 // 想了一下是否要置为leader id，觉得不需要
+		rf.changeState(StateFollower)
+	}
 	rf.electionTicker.Reset(randomElectionOutTime())
 	reply.Term = rf.currentTerm
+
+	// 处理日志逻辑
+
+	// 非心跳心跳
+	if len(args.Entries) != 0 {
+		ok, index := existMatchedEntry(rf, args.PrevLogIndex, args.PrevLogTerm)
+		if !ok {
+			return
+		}
+		// 删除冲突的条目
+		rf.logs = rf.logs[:index+1]
+		// 追加新条目
+		rf.logs = append(rf.logs, args.Entries...)
+	}
+
+	// 更新 commitIndex
+	if args.LeaderCommit > rf.commitIndex {
+		prevIndex := len(rf.logs) - 1
+		oldCommitIndex := rf.commitIndex
+		rf.commitIndex = args.LeaderCommit
+		if rf.commitIndex > prevIndex {
+			rf.commitIndex = prevIndex
+		}
+		// apply 已提交的日志条目
+		rf.applyLogEntries(oldCommitIndex, rf.commitIndex)
+	}
+
 	reply.Success = true
+}
+
+// 查找是否有日志 index 和 term 都匹配
+// 没有返回 false 和 -1; 有则返回 true 和对应的 index
+func existMatchedEntry(rf *Raft, index, term int) (bool, int) {
+	if len(rf.logs)-1 < index {
+		return false, -1
+	}
+
+	if rf.logs[index].Term != term {
+		return false, -1
+	}
+
+	return true, index
+}
+
+// todo: 待实现
+func (rf *Raft) applyLogEntries(oldCommitIndex, commitIndex int) {
+	if oldCommitIndex >= commitIndex {
+		return
+	}
+
+	klog.V(3).Infof("{s%d t%d} [apply] apply logs, old %d, new %d", rf.me, rf.currentTerm, oldCommitIndex, commitIndex)
+
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -271,11 +331,83 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command: command,
 	})
 
-	// todo: 调用 sendAppendEntries RPC 进行复制
-	go func() {
+	// todo: 重构，现在这样感觉不好看
+	klog.V(2).Infof("{s%d t%d} [req/log] append log index %d", rf.me, rf.currentTerm, len(rf.logs)-1)
 
-	}()
+	matchCount := 1 // matchIndex 值更新了的节点数. 在下面的实现中，即使有多个日志，
+	done := false
+	// commitIndex要么保持不变，要么就直接变到 lastLogIndex(而不会是中间的数值)
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		nextIndex := rf.nextIndex[i]
+		args := &AppendEntriesArgs{
+			Term:         rf.currentTerm,
+			LeaderId:     rf.me,
+			PrevLogIndex: nextIndex - 1,
+			PrevLogTerm:  rf.logs[nextIndex-1].Term,
+			Entries:      rf.logs[nextIndex:],
+			LeaderCommit: rf.commitIndex,
+		}
+		reply := &AppendEntriesReply{}
 
+		go func(i int) {
+			for {
+				rf.mu.Lock()
+				if rf.electionState != StateLeader {
+					rf.mu.Unlock()
+					return
+				}
+				rf.mu.Unlock()
+
+				ok := rf.sendAppendEntries(i, args, reply)
+				if !ok {
+					klog.V(1).Infof("{s%d t%d} [req/log] s%d disconnected", rf.me, rf.currentTerm, i)
+					return
+				}
+
+				rf.mu.Lock()
+				if rf.currentTerm < reply.Term {
+					rf.currentTerm = reply.Term
+					rf.votedFor = -1
+					rf.changeState(StateFollower)
+					// todo: 考虑是否要把重置超时时间写入 change 为 follower 中
+					rf.electionTicker.Reset(randomElectionOutTime())
+					rf.mu.Unlock()
+					return
+				}
+
+				if reply.Success {
+					rf.nextIndex[i] = len(rf.logs)
+					rf.matchIndex[i] = len(rf.logs) - 1
+					if !done {
+						matchCount++
+						if matchCount >= (len(rf.peers)+1)/2 {
+							done = true
+							oldCommitIndex := rf.commitIndex
+							// 上面保证了如果 term 变化会退出，因此这里不需要再判断
+							rf.commitIndex = len(rf.logs) - 1
+							rf.applyLogEntries(oldCommitIndex, rf.commitIndex)
+						}
+					}
+
+					rf.mu.Unlock()
+					return
+				}
+
+				// 不成功，则发送的日志往前移一个
+				klog.V(2).Infof("{s%d t%d} [req/log] nextIndex %d failed, retry a low index", rf.me, rf.currentTerm, nextIndex)
+				nextIndex--
+				args.Entries = rf.logs[nextIndex:]
+				args.PrevLogIndex = args.PrevLogIndex - 1
+				args.PrevLogTerm = rf.logs[args.PrevLogIndex].Term
+				rf.mu.Unlock()
+			}
+		}(i)
+	}
+
+	rf.heartbeatTicker.Reset(randomHeartbeatTime())
 	return len(rf.logs) - 1, rf.currentTerm, true
 }
 
@@ -346,6 +478,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.heartbeatTicker = time.NewTicker(randomHeartbeatTime())
 	// 一开始不需要心跳计时
 	rf.heartbeatTicker.Stop()
+
+	// 2B
+	rf.applyCh = applyCh
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
