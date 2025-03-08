@@ -67,27 +67,16 @@ type Raft struct {
 	votedFor    int        // 当前任期内投票给谁，未投票置为-1
 	logs        []LogEntry // 日志条目
 
-	// 易矢性状态
-	commitIndex int // 最大的已提交的日志条目索引
-	lastApplied int // 最大的已应用到状态机的日志条目索引
-
-	// leader 的易矢性状态，每次选举后重新初始化
-	nextIndex    []int        // 对每个节点，发送到该节点的下一个日志条目索引
-	matchIndex   []int        // 对每个节点，最大的已复制到该节点的日志条目索引，用于更新 commitIndex
-	matchCount   map[int]int  // 记录对于index i，matchIndex中超过i的节点个数
-	hasCommitted map[int]bool // 记录对于 index i，是否已commit
-
 	// 其他
-	leaderId        int           // 记录 leader id
 	electionState   ElectionState // 节点当前状态
 	electionTicker  *time.Ticker  // 选举超时定时器
 	heartbeatTicker *time.Ticker  // 心跳定时器
-	applyCh         chan ApplyMsg // apply 日志条目的通道，把已提交的日志条目发到这里来模拟在物理机上 apply 该 cmd
+
 }
 
 type LogEntry struct {
-	Term    int         // leader 收到该时 log 的任期
-	Command interface{} // 命令
+	Term    int    // leader 收到该时 log 的任期
+	Command string // 命令
 }
 
 type ElectionState int
@@ -146,19 +135,6 @@ func (rf *Raft) changeState(expectedState ElectionState) {
 		rf.electionState = StateLeader
 		rf.electionTicker.Stop()
 		rf.heartbeatTicker.Reset(randomHeartbeatTime())
-		// 初始化日志相关数据
-		leaderInit(rf)
-	}
-}
-
-func leaderInit(rf *Raft) {
-	rf.nextIndex = make([]int, len(rf.peers))
-	rf.matchIndex = make([]int, len(rf.peers))
-	rf.matchCount = make(map[int]int)
-	rf.hasCommitted = make(map[int]bool)
-
-	for i := 0; i < len(rf.peers); i++ {
-		rf.nextIndex[i] = len(rf.logs)
 	}
 }
 
@@ -215,14 +191,8 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 }
 
 type AppendEntriesArgs struct {
-	// 2A
 	Term     int // leader 的任期号
 	LeaderId int // leader id
-	// 2B
-	PrevLogIndex int        // 前一个日志条目的索引
-	PrevLogTerm  int        // 前一个日志条目的任期
-	Entries      []LogEntry // 发送的日志条目，一次可发送多个来提高效率。心跳则为空
-	LeaderCommit int        // leader 的 commitIndex
 }
 type AppendEntriesReply struct {
 	Term    int  // 节点的任期号
@@ -232,88 +202,27 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	// 注意用闭包而不是直接调用，不然Success的值一直都是false
-	defer func() {
-		if len(args.Entries) == 0 {
-			klog.V(3).Infof("{s%d t%d} [rcv/heart] ld%d t%d: %t; commitIndex %d", rf.me, rf.currentTerm, args.LeaderId, args.Term, reply.Success, rf.commitIndex)
-			return
-		}
-		klog.V(3).Infof("{s%d t%d} [rcv/log] ld%d t%d: %t; commitIndex %d; prevIndex %d, entryCnt %d", rf.me, rf.currentTerm, args.LeaderId, args.Term, reply.Success, rf.commitIndex, args.PrevLogIndex, len(args.Entries))
-	}()
+
+	klog.V(3).Infof("{s%d t%d} [rcv/log] ld%d t%d", rf.me, rf.currentTerm, args.LeaderId, args.Term)
+
+	if rf.currentTerm < args.Term {
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
+		rf.changeState(StateFollower)
+		rf.electionTicker.Reset(randomElectionOutTime())
+		reply.Term = rf.currentTerm
+		return
+	}
 
 	if rf.currentTerm > args.Term {
 		reply.Term = rf.currentTerm
 		return
 	}
 
-	if rf.currentTerm < args.Term {
-		rf.currentTerm = args.Term
-		rf.votedFor = -1 // 想了一下是否要置为leader id，觉得不需要
-		rf.changeState(StateFollower)
-	}
+	// 2A 不考虑日志，只看心跳
 	rf.electionTicker.Reset(randomElectionOutTime())
 	reply.Term = rf.currentTerm
-
-	// 处理日志逻辑
-
-	// 非心跳心跳
-	if len(args.Entries) != 0 {
-		ok, index := existMatchedEntry(rf, args.PrevLogIndex, args.PrevLogTerm)
-		if !ok {
-			return
-		}
-		// 删除冲突的条目
-		rf.logs = rf.logs[:index+1]
-		// 追加新条目
-		rf.logs = append(rf.logs, args.Entries...)
-	}
-
-	// 更新 commitIndex
-	if args.LeaderCommit > rf.commitIndex {
-		prevIndex := len(rf.logs) - 1
-		oldCommitIndex := rf.commitIndex
-		rf.commitIndex = args.LeaderCommit
-		if rf.commitIndex > prevIndex {
-			rf.commitIndex = prevIndex
-		}
-		// apply 已提交的日志条目
-		go rf.applyLogEntries(oldCommitIndex, rf.commitIndex)
-	}
-
 	reply.Success = true
-}
-
-// 查找是否有日志 index 和 term 都匹配
-// 没有返回 false 和 -1; 有则返回 true 和对应的 index
-func existMatchedEntry(rf *Raft, index, term int) (bool, int) {
-	if len(rf.logs)-1 < index {
-		return false, -1
-	}
-
-	if rf.logs[index].Term != term {
-		return false, -1
-	}
-
-	return true, index
-}
-
-func (rf *Raft) applyLogEntries(oldCommitIndex, commitIndex int) {
-	if oldCommitIndex >= commitIndex {
-		return
-	}
-
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	klog.V(3).Infof("{s%d t%d} [apply] apply logs, old %d, new %d", rf.me, rf.currentTerm, oldCommitIndex, commitIndex)
-
-	for i := oldCommitIndex + 1; i <= commitIndex; i++ {
-		msg := ApplyMsg{
-			CommandValid: true,
-			CommandIndex: i,
-			Command:      rf.logs[i].Command,
-		}
-		rf.applyCh <- msg
-	}
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -333,117 +242,13 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	index := -1
+	term := -1
+	isLeader := true
+
 	// Your code here (2B).
-	// 2B
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 
-	if rf.electionState != StateLeader {
-		return -1, -1, false
-	}
-
-	// 追加到自己的 logs 中，并向其他节点复制
-	rf.logs = append(rf.logs, LogEntry{
-		Term:    rf.currentTerm,
-		Command: command,
-	})
-
-	// todo: 重构，现在这样感觉不好看
-	klog.V(2).Infof("{s%d t%d} [req/log] append log index %d", rf.me, rf.currentTerm, len(rf.logs)-1)
-
-	for i := 0; i < len(rf.peers); i++ {
-		if i == rf.me {
-			continue
-		}
-		nextIndex := rf.nextIndex[i]
-		//lastLogIndex := len(rf.logs) - 1
-		args := &AppendEntriesArgs{
-			Term:         rf.currentTerm,
-			LeaderId:     rf.me,
-			PrevLogIndex: nextIndex - 1,
-			PrevLogTerm:  rf.logs[nextIndex-1].Term,
-			Entries:      rf.logs[nextIndex:],
-			LeaderCommit: rf.commitIndex,
-		}
-
-		go func(i int) {
-			for {
-				rf.mu.Lock()
-				if rf.electionState != StateLeader {
-					rf.mu.Unlock()
-					return
-				}
-
-				// 不发送重复的 log entry，应对同时来多个cmd的情况
-				// 例如 已经发送了 log[1:3]，不需要重复发log[1:2]
-				if nextIndex < rf.nextIndex[i] {
-					rf.mu.Unlock()
-					return
-				}
-
-				rf.mu.Unlock()
-
-				reply := &AppendEntriesReply{}
-
-				ok := rf.sendAppendEntries(i, args, reply)
-				if !ok {
-					rf.mu.Lock()
-					klog.V(1).Infof("{s%d t%d} [req/log] s%d disconnected", rf.me, rf.currentTerm, i)
-					rf.mu.Unlock()
-					return
-				}
-
-				rf.mu.Lock()
-				klog.V(2).Infof("{s%d t%d} [rcv/reply] handle server %d reply, prevIndex %d, entryCnt %d", rf.me, rf.currentTerm, i, args.PrevLogIndex, len(args.Entries))
-				if rf.currentTerm < reply.Term {
-					rf.currentTerm = reply.Term
-					rf.votedFor = -1
-					rf.changeState(StateFollower)
-					// todo: 考虑是否要把重置超时时间写入 change 为 follower 中
-					rf.electionTicker.Reset(randomElectionOutTime())
-					rf.mu.Unlock()
-					return
-				}
-
-				if reply.Success {
-					// 不需要重复处理已发送的log
-					// 例如先发了log[1:2],然后发log[1:3],但是log[1:3]先被reply，则log[1:2]的reply时无需重复处理
-					if (nextIndex + len(args.Entries)) < rf.nextIndex[i] {
-						rf.mu.Unlock()
-						return
-					}
-
-					rf.nextIndex[i] = nextIndex + len(args.Entries)
-					newMatchIndex := rf.nextIndex[i] - 1
-					rf.matchIndex[i] = newMatchIndex
-
-					rf.matchCount[newMatchIndex]++
-					if !rf.hasCommitted[newMatchIndex] && (rf.matchCount[newMatchIndex]+1) >= (len(rf.peers)+1)/2 {
-						rf.hasCommitted[newMatchIndex] = true
-						oldCommitIndex := rf.commitIndex
-						rf.commitIndex = newMatchIndex
-						klog.V(2).Infof("{s%d t%d} [commit] update commitIndex, old %d, new %d", rf.me, rf.currentTerm, oldCommitIndex, rf.commitIndex)
-						go rf.applyLogEntries(oldCommitIndex, newMatchIndex)
-					}
-
-					rf.mu.Unlock()
-					return
-				}
-
-				// 不成功，则发送的日志往前移一个
-				klog.V(2).Infof("{s%d t%d} [req/log] server %d nextIndex %d failed, retry a low index", rf.me, rf.currentTerm, i, nextIndex)
-				nextIndex--
-				args.Entries = rf.logs[nextIndex:]
-				args.PrevLogIndex = args.PrevLogIndex - 1
-				args.PrevLogTerm = rf.logs[args.PrevLogIndex].Term
-				args.LeaderCommit = rf.commitIndex
-				rf.mu.Unlock()
-			}
-		}(i)
-	}
-
-	rf.heartbeatTicker.Reset(randomHeartbeatTime())
-	return len(rf.logs) - 1, rf.currentTerm, true
+	return index, term, isLeader
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -507,15 +312,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	// 2A
 	rf.currentTerm = 0
-	rf.logs = []LogEntry{{Term: 0}} // 让 log entry 的初始索引为1
+	rf.logs = []LogEntry{{Term: 0}}
 	rf.electionState = StateFollower
 	rf.electionTicker = time.NewTicker(randomElectionOutTime())
 	rf.heartbeatTicker = time.NewTicker(randomHeartbeatTime())
 	// 一开始不需要心跳计时
 	rf.heartbeatTicker.Stop()
-
-	// 2B
-	rf.applyCh = applyCh
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())

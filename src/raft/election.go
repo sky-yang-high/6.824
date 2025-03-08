@@ -4,18 +4,13 @@ package raft
 // 锁: 先粒度粗一点，后面有需要再调细
 // 超时选举时间: 200+(0-100) 心跳时间: 100+(0-50)，大约两个心跳时间都没有收到就尝试选举
 
-import (
-	"k8s.io/klog/v2"
-)
+import "k8s.io/klog/v2"
 
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
 	// 2A
 	Term        int // candidate 的任期号
 	CandidateId int // candidate 的 id
-	// 2B
-	LastLogIndex int // candidate 的最后日志条目索引
-	LastLogTerm  int // candidate 的最后日志条目的任期号
 }
 
 type RequestVoteReply struct {
@@ -29,30 +24,34 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// 2A
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	defer klog.V(3).Infof("{s%d t%d} [rcv/vote] cd%d t%d: %t", rf.me, rf.currentTerm, args.CandidateId, args.Term, reply.VoteGranted)
+
+	klog.V(3).Infof("{s%d t%d} [rcv/vote] cd%d t%d", rf.me, rf.currentTerm, args.CandidateId, args.Term)
+
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.votedFor = args.CandidateId
+		rf.changeState(StateFollower)
+		rf.electionTicker.Reset(randomElectionOutTime())
+
+		reply.VoteGranted = true
+		reply.Term = args.Term
+		return
+	}
+
+	if args.Term == rf.currentTerm {
+		if rf.votedFor == -1 {
+			rf.votedFor = args.CandidateId
+			reply.VoteGranted = true
+			rf.electionTicker.Reset(randomElectionOutTime())
+		}
+		reply.Term = rf.currentTerm
+		return
+	}
 
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		return
 	}
-
-	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
-		rf.votedFor = -1
-		rf.changeState(StateFollower)
-	}
-
-	// 添加投票限制: 日志至少一样新才投给它
-	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
-		lastLogIndex := len(rf.logs) - 1
-		lastLogTerm := rf.logs[lastLogIndex].Term
-		if lastLogTerm < args.LastLogTerm || (lastLogTerm == args.LastLogTerm && lastLogIndex <= args.LastLogIndex) {
-			rf.votedFor = args.CandidateId
-			reply.VoteGranted = true
-			rf.electionTicker.Reset(randomElectionOutTime())
-		}
-	}
-	reply.Term = rf.currentTerm
 }
 
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
@@ -69,10 +68,8 @@ func tryRequestVote(rf *Raft) {
 	defer rf.mu.Unlock()
 
 	args := &RequestVoteArgs{
-		Term:         rf.currentTerm,
-		CandidateId:  rf.me,
-		LastLogIndex: len(rf.logs) - 1,
-		LastLogTerm:  rf.logs[len(rf.logs)-1].Term,
+		Term:        rf.currentTerm,
+		CandidateId: rf.me,
 	}
 
 	for i := 0; i < len(rf.peers); i++ {
@@ -121,11 +118,10 @@ func broadcastHeartbeat(rf *Raft) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	klog.V(3).Infof("{s%d t%d} [heart] broadcast heartbeat signal, commit %d", rf.me, rf.currentTerm, rf.commitIndex)
+	klog.V(3).Infof("{s%d t%d} [heart] broadcast heartbeat signal", rf.me, rf.currentTerm)
 	args := &AppendEntriesArgs{
-		Term:         rf.currentTerm,
-		LeaderId:     rf.me,
-		LeaderCommit: rf.commitIndex,
+		Term:     rf.currentTerm,
+		LeaderId: rf.me,
 	}
 
 	for i := 0; i < len(rf.peers); i++ {
