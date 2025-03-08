@@ -72,8 +72,10 @@ type Raft struct {
 	lastApplied int // 最大的已应用到状态机的日志条目索引
 
 	// leader 的易矢性状态，每次选举后重新初始化
-	nextIndex  []int // 对每个节点，发送到该节点的下一个日志条目索引
-	matchIndex []int // 对每个节点，最大的已复制到该节点的日志条目索引，用于更新 commitIndex
+	nextIndex    []int        // 对每个节点，发送到该节点的下一个日志条目索引
+	matchIndex   []int        // 对每个节点，最大的已复制到该节点的日志条目索引，用于更新 commitIndex
+	matchCount   map[int]int  // 记录对于index i，matchIndex中超过i的节点个数
+	hasCommitted map[int]bool // 记录对于 index i，是否已commit
 
 	// 其他
 	leaderId        int           // 记录 leader id
@@ -152,6 +154,8 @@ func (rf *Raft) changeState(expectedState ElectionState) {
 func leaderInit(rf *Raft) {
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
+	rf.matchCount = make(map[int]int)
+	rf.hasCommitted = make(map[int]bool)
 
 	for i := 0; i < len(rf.peers); i++ {
 		rf.nextIndex[i] = len(rf.logs)
@@ -230,7 +234,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 	// 注意用闭包而不是直接调用，不然Success的值一直都是false
 	defer func() {
-		klog.V(3).Infof("{s%d t%d} [rcv/log] ld%d t%d: %t; commitIndex %d", rf.me, rf.currentTerm, args.LeaderId, args.Term, reply.Success, rf.commitIndex)
+		if len(args.Entries) == 0 {
+			klog.V(3).Infof("{s%d t%d} [rcv/heart] ld%d t%d: %t; commitIndex %d", rf.me, rf.currentTerm, args.LeaderId, args.Term, reply.Success, rf.commitIndex)
+			return
+		}
+		klog.V(3).Infof("{s%d t%d} [rcv/log] ld%d t%d: %t; commitIndex %d; prevIndex %d, entryCnt %d", rf.me, rf.currentTerm, args.LeaderId, args.Term, reply.Success, rf.commitIndex, args.PrevLogIndex, len(args.Entries))
 	}()
 
 	if rf.currentTerm > args.Term {
@@ -269,7 +277,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.commitIndex = prevIndex
 		}
 		// apply 已提交的日志条目
-		rf.applyLogEntries(oldCommitIndex, rf.commitIndex)
+		go rf.applyLogEntries(oldCommitIndex, rf.commitIndex)
 	}
 
 	reply.Success = true
@@ -289,14 +297,23 @@ func existMatchedEntry(rf *Raft, index, term int) (bool, int) {
 	return true, index
 }
 
-// todo: 待实现
 func (rf *Raft) applyLogEntries(oldCommitIndex, commitIndex int) {
 	if oldCommitIndex >= commitIndex {
 		return
 	}
 
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	klog.V(3).Infof("{s%d t%d} [apply] apply logs, old %d, new %d", rf.me, rf.currentTerm, oldCommitIndex, commitIndex)
 
+	for i := oldCommitIndex + 1; i <= commitIndex; i++ {
+		msg := ApplyMsg{
+			CommandValid: true,
+			CommandIndex: i,
+			Command:      rf.logs[i].Command,
+		}
+		rf.applyCh <- msg
+	}
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -334,14 +351,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// todo: 重构，现在这样感觉不好看
 	klog.V(2).Infof("{s%d t%d} [req/log] append log index %d", rf.me, rf.currentTerm, len(rf.logs)-1)
 
-	matchCount := 1 // matchIndex 值更新了的节点数. 在下面的实现中，即使有多个日志，
-	done := false
-	// commitIndex要么保持不变，要么就直接变到 lastLogIndex(而不会是中间的数值)
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
 		}
 		nextIndex := rf.nextIndex[i]
+		//lastLogIndex := len(rf.logs) - 1
 		args := &AppendEntriesArgs{
 			Term:         rf.currentTerm,
 			LeaderId:     rf.me,
@@ -350,7 +365,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			Entries:      rf.logs[nextIndex:],
 			LeaderCommit: rf.commitIndex,
 		}
-		reply := &AppendEntriesReply{}
 
 		go func(i int) {
 			for {
@@ -359,15 +373,28 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 					rf.mu.Unlock()
 					return
 				}
+
+				// 不发送重复的 log entry，应对同时来多个cmd的情况
+				// 例如 已经发送了 log[1:3]，不需要重复发log[1:2]
+				if nextIndex < rf.nextIndex[i] {
+					rf.mu.Unlock()
+					return
+				}
+
 				rf.mu.Unlock()
+
+				reply := &AppendEntriesReply{}
 
 				ok := rf.sendAppendEntries(i, args, reply)
 				if !ok {
+					rf.mu.Lock()
 					klog.V(1).Infof("{s%d t%d} [req/log] s%d disconnected", rf.me, rf.currentTerm, i)
+					rf.mu.Unlock()
 					return
 				}
 
 				rf.mu.Lock()
+				klog.V(2).Infof("{s%d t%d} [rcv/reply] handle server %d reply, prevIndex %d, entryCnt %d", rf.me, rf.currentTerm, i, args.PrevLogIndex, len(args.Entries))
 				if rf.currentTerm < reply.Term {
 					rf.currentTerm = reply.Term
 					rf.votedFor = -1
@@ -379,17 +406,24 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 				}
 
 				if reply.Success {
-					rf.nextIndex[i] = len(rf.logs)
-					rf.matchIndex[i] = len(rf.logs) - 1
-					if !done {
-						matchCount++
-						if matchCount >= (len(rf.peers)+1)/2 {
-							done = true
-							oldCommitIndex := rf.commitIndex
-							// 上面保证了如果 term 变化会退出，因此这里不需要再判断
-							rf.commitIndex = len(rf.logs) - 1
-							rf.applyLogEntries(oldCommitIndex, rf.commitIndex)
-						}
+					// 不需要重复处理已发送的log
+					// 例如先发了log[1:2],然后发log[1:3],但是log[1:3]先被reply，则log[1:2]的reply时无需重复处理
+					if (nextIndex + len(args.Entries)) < rf.nextIndex[i] {
+						rf.mu.Unlock()
+						return
+					}
+
+					rf.nextIndex[i] = nextIndex + len(args.Entries)
+					newMatchIndex := rf.nextIndex[i] - 1
+					rf.matchIndex[i] = newMatchIndex
+
+					rf.matchCount[newMatchIndex]++
+					if !rf.hasCommitted[newMatchIndex] && (rf.matchCount[newMatchIndex]+1) >= (len(rf.peers)+1)/2 {
+						rf.hasCommitted[newMatchIndex] = true
+						oldCommitIndex := rf.commitIndex
+						rf.commitIndex = newMatchIndex
+						klog.V(2).Infof("{s%d t%d} [commit] update commitIndex, old %d, new %d", rf.me, rf.currentTerm, oldCommitIndex, rf.commitIndex)
+						go rf.applyLogEntries(oldCommitIndex, newMatchIndex)
 					}
 
 					rf.mu.Unlock()
@@ -397,11 +431,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 				}
 
 				// 不成功，则发送的日志往前移一个
-				klog.V(2).Infof("{s%d t%d} [req/log] nextIndex %d failed, retry a low index", rf.me, rf.currentTerm, nextIndex)
+				klog.V(2).Infof("{s%d t%d} [req/log] server %d nextIndex %d failed, retry a low index", rf.me, rf.currentTerm, i, nextIndex)
 				nextIndex--
 				args.Entries = rf.logs[nextIndex:]
 				args.PrevLogIndex = args.PrevLogIndex - 1
 				args.PrevLogTerm = rf.logs[args.PrevLogIndex].Term
+				args.LeaderCommit = rf.commitIndex
 				rf.mu.Unlock()
 			}
 		}(i)

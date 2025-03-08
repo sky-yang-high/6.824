@@ -121,7 +121,7 @@ func broadcastHeartbeat(rf *Raft) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	klog.V(3).Infof("{s%d t%d} [heart] broadcast heartbeat signal", rf.me, rf.currentTerm)
+	klog.V(3).Infof("{s%d t%d} [heart] broadcast heartbeat signal, commit %d", rf.me, rf.currentTerm, rf.commitIndex)
 	args := &AppendEntriesArgs{
 		Term:         rf.currentTerm,
 		LeaderId:     rf.me,
