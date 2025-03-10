@@ -82,8 +82,8 @@ func (rf *Raft) replicator(peer int) {
 	defer rf.replicatorCond[peer].L.Unlock()
 
 	for !rf.killed() {
-		// 需要复制，则直接进行复制，否则Start等待唤醒
-		for !rf.needReplicating() {
+		// 等待直到需要复制
+		for !rf.needReplicating(peer) {
 			rf.replicatorCond[peer].Wait()
 		}
 
@@ -91,15 +91,12 @@ func (rf *Raft) replicator(peer int) {
 	}
 }
 
-// todo: 判断是否需要复制日志
-func (rf *Raft) needReplicating() bool {
+func (rf *Raft) needReplicating(peer int) bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	return false
+	return rf.electionState == StateLeader && rf.matchIndex[peer] < (len(rf.logs)-1)
 }
 
-// todo: 实现具体的 leader-follower 直接日志复制的逻辑
-// ? 感觉心跳信号不需要传下来，因为走日志复制的逻辑的话，传出去的 entry 也是空的
 func (rf *Raft) trySendAppendEntries(peer int, isHeart bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -125,7 +122,7 @@ func (rf *Raft) trySendAppendEntries(peer int, isHeart bool) {
 	}
 	reply := &AppendEntriesReply{}
 
-	klog.V(3).Infof("{s%d t%d} [send/log] p%d, isHeart %t, prev %d, logLength %d", rf.me, rf.currentTerm, peer, isHeart, args.PrevLogIndex, len(args.Entries))
+	klog.V(3).Infof("{s%d t%d} [send/log] p%d, isHeart %t, prev %d, logLength %d, ldCommit %d", rf.me, rf.currentTerm, peer, isHeart, args.PrevLogIndex, len(args.Entries), rf.commitIndex)
 	rf.mu.Unlock()
 
 	ok := rf.sendAppendEntries(peer, args, reply)
@@ -157,7 +154,37 @@ func (rf *Raft) trySendAppendEntries(peer int, isHeart bool) {
 	// 成功，更新相关字段
 	rf.nextIndex[peer] = len(args.Entries) + args.PrevLogIndex + 1
 	rf.matchIndex[peer] = rf.nextIndex[peer] - 1
-	// todo: 调用 apply 过程
+
+	// 更新 leader 的 commitIndex
+	rf.checkAndUpdateLeaderCommit(rf.matchIndex[peer])
+}
+
+func (rf *Raft) checkAndUpdateLeaderCommit(matchIndex int) {
+	// 后续加读锁
+
+	if matchIndex <= rf.lastApplied || matchIndex <= rf.commitIndex {
+		return
+	}
+
+	cnt := 1
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		if rf.matchIndex[i] >= matchIndex {
+			cnt++
+		}
+	}
+
+	// 不到半数，无法 apply
+	if cnt < (len(rf.peers)+1)/2 {
+		return
+	}
+
+	oldCommit := rf.commitIndex
+	rf.commitIndex = matchIndex
+	klog.V(2).Infof("{s%d t%d} [update/commit] commit %d -> %d", rf.me, rf.currentTerm, oldCommit, matchIndex)
+	rf.applyCond.Signal()
 }
 
 func (rf *Raft) sendAppendEntries(peer int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -190,7 +217,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			return
 		}
 		// 删除冲突的条目
-		rf.logs = rf.logs[:args.PrevLogIndex]
+		rf.logs = rf.logs[:args.PrevLogIndex+1]
 		// 追加新条目
 		rf.logs = append(rf.logs, args.Entries...)
 
@@ -201,6 +228,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		oldCommit := rf.commitIndex
 		rf.commitIndex = min(args.LeaderCommit, len(rf.logs)-1)
 		klog.V(2).Infof("{s%d t%d} [rcv/log] ldCommit %d, commit %d -> %d", rf.me, rf.currentTerm, args.LeaderCommit, oldCommit, rf.commitIndex)
+		rf.applyCond.Signal()
 	}
 	reply.Success = true
 }
@@ -214,4 +242,42 @@ func (rf *Raft) hasMatchEntry(prevIndex, prevTerm int) bool {
 		return false
 	}
 	return true
+}
+
+func (rf *Raft) applier() {
+	rf.applyCond.L.Lock()
+	defer rf.applyCond.L.Unlock()
+
+	for !rf.killed() {
+		for !rf.needApply() {
+			rf.applyCond.Wait()
+		}
+
+		rf.applyToTester()
+	}
+}
+
+func (rf *Raft) needApply() bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// 只能 apply 当前任期的日志
+	return rf.lastApplied < rf.commitIndex && rf.logs[rf.commitIndex].Term == rf.currentTerm
+}
+
+func (rf *Raft) applyToTester() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+		applyMsg := ApplyMsg{
+			CommandValid: true,
+			Command:      rf.logs[i].Command,
+			CommandIndex: i,
+		}
+
+		rf.applyCh <- applyMsg
+		klog.V(3).Infof("{s%d t%d} [apply] idx%d, t%d", rf.me, rf.currentTerm, i, rf.logs[i].Term)
+		rf.lastApplied++
+	}
 }

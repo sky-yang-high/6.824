@@ -83,7 +83,8 @@ type Raft struct {
 	electionTicker  *time.Ticker  // 选举超时定时器
 	heartbeatTicker *time.Ticker  // 心跳定时器
 
-	applyCh chan ApplyMsg // apply 日志到状态机的通道
+	applyCh   chan ApplyMsg // apply 日志到状态机的通道
+	applyCond sync.Cond     // 同样使用条件变量控制 apply
 }
 
 type ElectionState int
@@ -279,7 +280,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		electionTicker:  time.NewTicker(randomElectionOutTime()),
 		heartbeatTicker: time.NewTicker(randomHeartbeatTime()),
 
-		applyCh: applyCh,
+		applyCh:   applyCh,
+		applyCond: *sync.NewCond(&sync.Mutex{}),
 	}
 
 	// 一开始不需要心跳计时
@@ -299,6 +301,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+
+	go rf.applier()
 
 	return rf
 }
