@@ -52,6 +52,7 @@ type ApplyMsg struct {
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
+	// todo: 使用 RW 锁来进一步控制粒度
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
@@ -67,16 +68,18 @@ type Raft struct {
 	votedFor    int        // 当前任期内投票给谁，未投票置为-1
 	logs        []LogEntry // 日志条目
 
+	// leader 的易矢性状态，每次选举后重新初始化
+	nextIndex  []int // 对每个节点，发送到该节点的下一个日志条目索引
+	matchIndex []int // 对每个节点，最大的已复制到该节点的日志条目索引，用于更新 commitIndex
+
+	replicatorCond []*sync.Cond // 使用条件变量来控制日志复制
+
 	// 其他
 	electionState   ElectionState // 节点当前状态
 	electionTicker  *time.Ticker  // 选举超时定时器
 	heartbeatTicker *time.Ticker  // 心跳定时器
 
-}
-
-type LogEntry struct {
-	Term    int    // leader 收到该时 log 的任期
-	Command string // 命令
+	applyCh chan ApplyMsg // apply 日志到状态机的通道
 }
 
 type ElectionState int
@@ -135,6 +138,9 @@ func (rf *Raft) changeState(expectedState ElectionState) {
 		rf.electionState = StateLeader
 		rf.electionTicker.Stop()
 		rf.heartbeatTicker.Reset(randomHeartbeatTime())
+		for i := 0; i < len(rf.peers); i++ {
+			rf.nextIndex[i] = len(rf.logs)
+		}
 	}
 }
 
@@ -190,67 +196,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-type AppendEntriesArgs struct {
-	Term     int // leader 的任期号
-	LeaderId int // leader id
-}
-type AppendEntriesReply struct {
-	Term    int  // 节点的任期号
-	Success bool // 日志追加是否成功
-}
-
-func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	klog.V(3).Infof("{s%d t%d} [rcv/log] ld%d t%d", rf.me, rf.currentTerm, args.LeaderId, args.Term)
-
-	if rf.currentTerm < args.Term {
-		rf.currentTerm = args.Term
-		rf.votedFor = -1
-		rf.changeState(StateFollower)
-		rf.electionTicker.Reset(randomElectionOutTime())
-		reply.Term = rf.currentTerm
-		return
-	}
-
-	if rf.currentTerm > args.Term {
-		reply.Term = rf.currentTerm
-		return
-	}
-
-	// 2A 不考虑日志，只看心跳
-	rf.electionTicker.Reset(randomElectionOutTime())
-	reply.Term = rf.currentTerm
-	reply.Success = true
-}
-
-func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	return rf.peers[server].Call("Raft.AppendEntries", args, reply)
-}
-
-// the service using Raft (e.g. a k/v server) wants to start
-// agreement on the next command to be appended to Raft's log. if this
-// server isn't the leader, returns false. otherwise start the
-// agreement and return immediately. there is no guarantee that this
-// command will ever be committed to the Raft log, since the leader
-// may fail or lose an election. even if the Raft instance has been killed,
-// this function should return gracefully.
-//
-// the first return value is the index that the command will appear at
-// if it's ever committed. the second return value is the current
-// term. the third return value is true if this server believes it is
-// the leader.
-func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
-	// Your code here (2B).
-
-	return index, term, isLeader
-}
-
 // the tester doesn't halt goroutines created by Raft after each test,
 // but it does call the Kill() method. your code can use killed() to
 // check whether Kill() has been called. the use of atomic avoids the
@@ -287,7 +232,7 @@ func (rf *Raft) ticker() {
 			rf.mu.Unlock()
 			tryRequestVote(rf)
 		case <-rf.heartbeatTicker.C:
-			broadcastHeartbeat(rf)
+			rf.broadcast(true)
 			rf.heartbeatTicker.Reset(randomHeartbeatTime())
 		}
 	}
@@ -304,20 +249,39 @@ func (rf *Raft) ticker() {
 // for any long-running work.
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
-	rf := &Raft{}
-	rf.peers = peers
-	rf.persister = persister
-	rf.me = me
-
 	// Your initialization code here (2A, 2B, 2C).
-	// 2A
-	rf.currentTerm = 0
-	rf.logs = []LogEntry{{Term: 0}}
-	rf.electionState = StateFollower
-	rf.electionTicker = time.NewTicker(randomElectionOutTime())
-	rf.heartbeatTicker = time.NewTicker(randomHeartbeatTime())
+	rf := &Raft{
+		mu:        sync.Mutex{},
+		peers:     peers,
+		persister: persister,
+		me:        me,
+
+		currentTerm: 0,
+		votedFor:    -1,
+		logs:        []LogEntry{{Term: 0}},
+
+		nextIndex:      make([]int, len(peers)),
+		matchIndex:     make([]int, len(peers)),
+		replicatorCond: make([]*sync.Cond, len(peers)),
+
+		electionState:   StateFollower,
+		electionTicker:  time.NewTicker(randomElectionOutTime()),
+		heartbeatTicker: time.NewTicker(randomHeartbeatTime()),
+
+		applyCh: applyCh,
+	}
+
 	// 一开始不需要心跳计时
 	rf.heartbeatTicker.Stop()
+
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		rf.matchIndex[i], rf.nextIndex[i] = 0, 1
+		rf.replicatorCond[i] = sync.NewCond(&sync.Mutex{})
+		go rf.replicator(i)
+	}
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())

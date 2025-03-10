@@ -11,6 +11,10 @@ type RequestVoteArgs struct {
 	// 2A
 	Term        int // candidate 的任期号
 	CandidateId int // candidate 的 id
+
+	// 2B
+	LastLogIndex int // 最新的日志条目的索引
+	LastLogTerm  int // 最新的日志条目的任期号
 }
 
 type RequestVoteReply struct {
@@ -24,34 +28,30 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// 2A
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
-	klog.V(3).Infof("{s%d t%d} [rcv/vote] cd%d t%d", rf.me, rf.currentTerm, args.CandidateId, args.Term)
-
-	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
-		rf.votedFor = args.CandidateId
-		rf.changeState(StateFollower)
-		rf.electionTicker.Reset(randomElectionOutTime())
-
-		reply.VoteGranted = true
-		reply.Term = args.Term
-		return
-	}
-
-	if args.Term == rf.currentTerm {
-		if rf.votedFor == -1 {
-			rf.votedFor = args.CandidateId
-			reply.VoteGranted = true
-			rf.electionTicker.Reset(randomElectionOutTime())
-		}
-		reply.Term = rf.currentTerm
-		return
-	}
+	defer klog.V(3).Infof("{s%d t%d} [rcv/vote] cd%d t%d: %t", rf.me, rf.currentTerm, args.CandidateId, args.Term, reply.VoteGranted)
 
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		return
 	}
+
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
+		rf.changeState(StateFollower)
+	}
+
+	// 添加投票限制: 日志至少一样新才投给它
+	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+		lastLogIndex := len(rf.logs) - 1
+		lastLogTerm := rf.logs[lastLogIndex].Term
+		if lastLogTerm < args.LastLogTerm || (lastLogTerm == args.LastLogTerm && lastLogIndex <= args.LastLogIndex) {
+			rf.votedFor = args.CandidateId
+			reply.VoteGranted = true
+			rf.electionTicker.Reset(randomElectionOutTime())
+		}
+	}
+	reply.Term = rf.currentTerm
 }
 
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
@@ -68,8 +68,10 @@ func tryRequestVote(rf *Raft) {
 	defer rf.mu.Unlock()
 
 	args := &RequestVoteArgs{
-		Term:        rf.currentTerm,
-		CandidateId: rf.me,
+		Term:         rf.currentTerm,
+		CandidateId:  rf.me,
+		LastLogIndex: len(rf.logs) - 1,
+		LastLogTerm:  rf.logs[len(rf.logs)-1].Term,
 	}
 
 	for i := 0; i < len(rf.peers); i++ {
@@ -101,7 +103,7 @@ func tryRequestVote(rf *Raft) {
 					klog.V(1).Infof("{s%d t%d} [vote] got %d votes", rf.me, rf.currentTerm, vote)
 					// 获得半数以上选票，成为 leader
 					rf.changeState(StateLeader)
-					go broadcastHeartbeat(rf)
+					go rf.broadcast(true)
 				}
 			}
 			// 还有一种 rf.currentTerm > reply.Term 的情况，不应当出现，
@@ -113,35 +115,35 @@ func tryRequestVote(rf *Raft) {
 	// 而如果没有收到，则在下次超时时还是进入 candidate 状态
 }
 
-// leader 定期广播心跳
-func broadcastHeartbeat(rf *Raft) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+// // leader 定期广播心跳
+// func broadcastHeartbeat(rf *Raft) {
+// 	rf.mu.Lock()
+// 	defer rf.mu.Unlock()
 
-	klog.V(3).Infof("{s%d t%d} [heart] broadcast heartbeat signal", rf.me, rf.currentTerm)
-	args := &AppendEntriesArgs{
-		Term:     rf.currentTerm,
-		LeaderId: rf.me,
-	}
+// 	klog.V(3).Infof("{s%d t%d} [heart] broadcast heartbeat signal", rf.me, rf.currentTerm)
+// 	args := &AppendEntriesArgs{
+// 		Term:     rf.currentTerm,
+// 		LeaderId: rf.me,
+// 	}
 
-	for i := 0; i < len(rf.peers); i++ {
-		if i == rf.me {
-			continue
-		}
-		go func(i int) {
-			reply := &AppendEntriesReply{}
-			if rf.sendAppendEntries(i, args, reply) {
-				rf.mu.Lock()
-				defer rf.mu.Unlock()
+// 	for i := 0; i < len(rf.peers); i++ {
+// 		if i == rf.me {
+// 			continue
+// 		}
+// 		go func(i int) {
+// 			reply := &AppendEntriesReply{}
+// 			if rf.sendAppendEntries(i, args, reply) {
+// 				rf.mu.Lock()
+// 				defer rf.mu.Unlock()
 
-				if rf.currentTerm < reply.Term {
-					klog.V(1).Infof("{s%d t%d} [heart] s%d send a higher t%d, backward to follower", rf.me, rf.currentTerm, i, reply.Term)
-					rf.currentTerm = reply.Term
-					rf.votedFor = -1
-					rf.changeState(StateFollower)
-					rf.electionTicker.Reset(randomElectionOutTime())
-				}
-			}
-		}(i)
-	}
-}
+// 				if rf.currentTerm < reply.Term {
+// 					klog.V(1).Infof("{s%d t%d} [heart] s%d send a higher t%d, backward to follower", rf.me, rf.currentTerm, i, reply.Term)
+// 					rf.currentTerm = reply.Term
+// 					rf.votedFor = -1
+// 					rf.changeState(StateFollower)
+// 					rf.electionTicker.Reset(randomElectionOutTime())
+// 				}
+// 			}
+// 		}(i)
+// 	}
+// }
