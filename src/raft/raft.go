@@ -68,6 +68,10 @@ type Raft struct {
 	votedFor    int        // 当前任期内投票给谁，未投票置为-1
 	logs        []LogEntry // 日志条目
 
+	// 易矢性状态
+	commitIndex int // 最大的已提交的日志条目索引
+	lastApplied int // 最大的已应用到状态机的日志条目索引
+
 	// leader 的易矢性状态，每次选举后重新初始化
 	nextIndex  []int // 对每个节点，发送到该节点的下一个日志条目索引
 	matchIndex []int // 对每个节点，最大的已复制到该节点的日志条目索引，用于更新 commitIndex
@@ -225,15 +229,19 @@ func (rf *Raft) ticker() {
 
 		select {
 		case <-rf.electionTicker.C:
-			// 超时，转为 candidate 并发起选举，并重置 ticker，避免选举过程超时卡住
-			rf.electionTicker.Reset(randomElectionOutTime())
-			rf.mu.Lock()
-			rf.changeState(StateCandidate)
-			rf.mu.Unlock()
-			tryRequestVote(rf)
+			if !rf.killed() {
+				// 超时，转为 candidate 并发起选举，并重置 ticker，避免选举过程超时卡住
+				rf.electionTicker.Reset(randomElectionOutTime())
+				rf.mu.Lock()
+				rf.changeState(StateCandidate)
+				rf.mu.Unlock()
+				tryRequestVote(rf)
+			}
 		case <-rf.heartbeatTicker.C:
-			rf.broadcast(true)
-			rf.heartbeatTicker.Reset(randomHeartbeatTime())
+			if !rf.killed() {
+				rf.broadcast(true)
+				rf.heartbeatTicker.Reset(randomHeartbeatTime())
+			}
 		}
 	}
 }
@@ -259,6 +267,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		currentTerm: 0,
 		votedFor:    -1,
 		logs:        []LogEntry{{Term: 0}},
+
+		commitIndex: 0,
+		lastApplied: 0,
 
 		nextIndex:      make([]int, len(peers)),
 		matchIndex:     make([]int, len(peers)),

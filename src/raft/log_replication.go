@@ -69,7 +69,7 @@ func (rf *Raft) broadcast(isHeart bool) {
 		}
 
 		if isHeart {
-			go rf.trySendAppendEntries(i, isHeart)
+			go rf.trySendAppendEntries(i, true)
 		} else {
 			rf.replicatorCond[i].Signal() // 和上一版的关键区别
 		}
@@ -99,6 +99,7 @@ func (rf *Raft) needReplicating() bool {
 }
 
 // todo: 实现具体的 leader-follower 直接日志复制的逻辑
+// ? 感觉心跳信号不需要传下来，因为走日志复制的逻辑的话，传出去的 entry 也是空的
 func (rf *Raft) trySendAppendEntries(peer int, isHeart bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -107,6 +108,56 @@ func (rf *Raft) trySendAppendEntries(peer int, isHeart bool) {
 	if rf.electionState != StateLeader {
 		return
 	}
+
+	// 不应该 >, 最多只能 =
+	if rf.nextIndex[peer] > len(rf.logs) {
+		klog.V(1).Infof("{s%d t%d} [send/log] p%d nextIdx %d > logLength %d", rf.me, rf.currentTerm, peer, rf.nextIndex[peer], len(rf.logs))
+		return
+	}
+
+	args := &AppendEntriesArgs{
+		Term:         rf.currentTerm,
+		LeaderId:     rf.me,
+		LeaderCommit: rf.commitIndex,
+		PrevLogIndex: rf.nextIndex[peer] - 1,
+		PrevLogTerm:  rf.logs[rf.nextIndex[peer]-1].Term,
+		Entries:      rf.logs[rf.nextIndex[peer]:],
+	}
+	reply := &AppendEntriesReply{}
+
+	klog.V(3).Infof("{s%d t%d} [send/log] p%d, isHeart %t, prev %d, logLength %d", rf.me, rf.currentTerm, peer, isHeart, args.PrevLogIndex, len(args.Entries))
+	rf.mu.Unlock()
+
+	ok := rf.sendAppendEntries(peer, args, reply)
+
+	rf.mu.Lock()
+	if !ok {
+		klog.V(1).Infof("{s%d t%d} [send/log] p%d timeout", rf.me, rf.currentTerm, peer)
+		return
+	}
+
+	if rf.currentTerm < reply.Term {
+		klog.V(1).Infof("{s%d t%d} [rcv/reply] p%d send a higher t%d, backward to follower", rf.me, rf.currentTerm, peer, reply.Term)
+		rf.currentTerm = reply.Term
+		rf.votedFor = -1
+		rf.changeState(StateFollower)
+		rf.electionTicker.Reset(randomElectionOutTime())
+		return
+	}
+
+	klog.V(3).Infof("{s%d t%d} [rcv/reply] p%d, isHeart %t, prev %d, logLength %d, result: %t", rf.me, rf.currentTerm, peer, isHeart, args.PrevLogIndex, len(args.Entries), reply.Success)
+
+	// 不成功，递减 nextIdx，等下次调用
+	if !reply.Success {
+		// todo: 优化，reply 中直接告诉 next 应该是几
+		rf.nextIndex[peer]--
+		return
+	}
+
+	// 成功，更新相关字段
+	rf.nextIndex[peer] = len(args.Entries) + args.PrevLogIndex + 1
+	rf.matchIndex[peer] = rf.nextIndex[peer] - 1
+	// todo: 调用 apply 过程
 }
 
 func (rf *Raft) sendAppendEntries(peer int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -117,24 +168,50 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	klog.V(3).Infof("{s%d t%d} [rcv/log] ld%d t%d", rf.me, rf.currentTerm, args.LeaderId, args.Term)
-
-	if rf.currentTerm < args.Term {
-		rf.currentTerm = args.Term
-		rf.votedFor = -1
-		rf.changeState(StateFollower)
-		rf.electionTicker.Reset(randomElectionOutTime())
-		reply.Term = rf.currentTerm
-		return
-	}
+	klog.V(3).Infof("{s%d t%d} [rcv/log] ld%d t%d, prev %d, logLength %d", rf.me, rf.currentTerm, args.LeaderId, args.Term, args.PrevLogIndex, len(args.Entries))
 
 	if rf.currentTerm > args.Term {
 		reply.Term = rf.currentTerm
 		return
 	}
 
-	// 2A 不考虑日志，只看心跳
+	if rf.currentTerm < args.Term {
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
+		rf.changeState(StateFollower)
+	}
+
 	rf.electionTicker.Reset(randomElectionOutTime())
 	reply.Term = rf.currentTerm
+
+	// 比较日志
+	if len(args.Entries) != 0 {
+		if !rf.hasMatchEntry(args.PrevLogIndex, args.PrevLogTerm) {
+			return
+		}
+		// 删除冲突的条目
+		rf.logs = rf.logs[:args.PrevLogIndex]
+		// 追加新条目
+		rf.logs = append(rf.logs, args.Entries...)
+
+	}
+
+	// 更新 commitIndex
+	if args.LeaderCommit > rf.commitIndex {
+		oldCommit := rf.commitIndex
+		rf.commitIndex = min(args.LeaderCommit, len(rf.logs)-1)
+		klog.V(2).Infof("{s%d t%d} [rcv/log] ldCommit %d, commit %d -> %d", rf.me, rf.currentTerm, args.LeaderCommit, oldCommit, rf.commitIndex)
+	}
 	reply.Success = true
+}
+
+// 只在 lock 中调用，无需加锁
+func (rf *Raft) hasMatchEntry(prevIndex, prevTerm int) bool {
+	if len(rf.logs)-1 < prevIndex {
+		return false
+	}
+	if rf.logs[prevIndex].Term != prevTerm {
+		return false
+	}
+	return true
 }
