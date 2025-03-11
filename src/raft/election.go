@@ -41,6 +41,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 		rf.changeState(StateFollower)
+		// 这里不需要重置超时选举计时器
+		// 考虑这种情况: 两个follower(f1,f2),f1日志更新。某一刻 leader 失联了，而f2先成为 candidate
+		// f1 在收到 f2 的投票请求时不会投给它(因为f1日志更新)。如果f1此时重置计时器，则f1,f2会再进入下一轮选举。
+		// 极端情况 f2 总是先比 f1 超时(当然几乎不可能)，那么这个过程就会一直持续下去。反之 f1 不重置的话，在f1超时后f2就会投给f1了。
 	}
 
 	// 添加投票限制: 日志至少一样新才投给它

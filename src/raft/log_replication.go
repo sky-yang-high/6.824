@@ -108,7 +108,7 @@ func (rf *Raft) trySendAppendEntries(peer int, isHeart bool) {
 
 	// 不应该 >, 最多只能 =
 	if rf.nextIndex[peer] > len(rf.logs) {
-		klog.V(1).Infof("{s%d t%d} [send/log] p%d nextIdx %d > logLength %d", rf.me, rf.currentTerm, peer, rf.nextIndex[peer], len(rf.logs))
+		klog.V(1).Infof("{s%d t%d} [send/log] s%d nextIdx %d > logLength %d", rf.me, rf.currentTerm, peer, rf.nextIndex[peer], len(rf.logs))
 		return
 	}
 
@@ -122,19 +122,19 @@ func (rf *Raft) trySendAppendEntries(peer int, isHeart bool) {
 	}
 	reply := &AppendEntriesReply{}
 
-	klog.V(3).Infof("{s%d t%d} [send/log] p%d, isHeart %t, prev %d, logLength %d, ldCommit %d", rf.me, rf.currentTerm, peer, isHeart, args.PrevLogIndex, len(args.Entries), rf.commitIndex)
+	klog.V(3).Infof("{s%d t%d} [send/log] s%d, isHeart %t, prev %d, logLength %d, ldCommit %d", rf.me, rf.currentTerm, peer, isHeart, args.PrevLogIndex, len(args.Entries), rf.commitIndex)
 	rf.mu.Unlock()
 
 	ok := rf.sendAppendEntries(peer, args, reply)
 
 	rf.mu.Lock()
 	if !ok {
-		klog.V(1).Infof("{s%d t%d} [send/log] p%d timeout", rf.me, rf.currentTerm, peer)
+		klog.V(1).Infof("{s%d t%d} [send/log] s%d timeout", rf.me, rf.currentTerm, peer)
 		return
 	}
 
 	if rf.currentTerm < reply.Term {
-		klog.V(1).Infof("{s%d t%d} [rcv/reply] p%d send a higher t%d, backward to follower", rf.me, rf.currentTerm, peer, reply.Term)
+		klog.V(1).Infof("{s%d t%d} [rcv/reply] s%d send a higher t%d, backward to follower", rf.me, rf.currentTerm, peer, reply.Term)
 		rf.currentTerm = reply.Term
 		rf.votedFor = -1
 		rf.changeState(StateFollower)
@@ -142,7 +142,7 @@ func (rf *Raft) trySendAppendEntries(peer int, isHeart bool) {
 		return
 	}
 
-	klog.V(3).Infof("{s%d t%d} [rcv/reply] p%d, isHeart %t, prev %d, logLength %d, result: %t", rf.me, rf.currentTerm, peer, isHeart, args.PrevLogIndex, len(args.Entries), reply.Success)
+	klog.V(3).Infof("{s%d t%d} [rcv/reply] s%d, isHeart %t, prev %d, logLength %d, result: %t", rf.me, rf.currentTerm, peer, isHeart, args.PrevLogIndex, len(args.Entries), reply.Success)
 
 	// 不成功，递减 nextIdx，等下次调用
 	if !reply.Success {
@@ -205,9 +205,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if rf.currentTerm < args.Term {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
-		rf.changeState(StateFollower)
 	}
 
+	// 考虑一种情况，该 follower 先超时，成为 candidate(term+1之后和leader一样)(比如说 leader 的最初两个心跳没收到)
+	// 它此时还是应该切换回 follower 状态(虽然处理 RPC 时 follower 和 candidate 是一样的)
+	rf.changeState(StateFollower)
 	rf.electionTicker.Reset(randomElectionOutTime())
 	reply.Term = rf.currentTerm
 
